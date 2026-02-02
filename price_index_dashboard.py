@@ -24,7 +24,6 @@ ITEM_SELECT_KEY = "price_index_item_select"
 ITEM_INPUT_KEY = "price_index_item_input"
 ITEM_LAST_SELECTED_KEY = "price_index_item_last_selected"
 SHOW_PRICE_LABELS_KEY = "price_index_show_price_labels"
-BRAND_SELECTION_KEY = "price_index_brand_selection"
 BRAND_ALIASES: dict[str, tuple[str, ...]] = {
     "Atyab": ("atyab",),
     "Chikitita": ("chikitita", "chikitia"),
@@ -482,32 +481,21 @@ st.caption(" | ".join(caption_parts))
 
 with filters_container:
     default_brand_selection = _default_brand_window(available_brands, base_brand)
-    stored_brands = st.session_state.get(BRAND_SELECTION_KEY)
-    if stored_brands is None:
-        stored_brands = list(available_brands)
-    else:
-        stored_brands = [brand for brand in stored_brands if brand in available_brands]
-        if not stored_brands:
-            stored_brands = list(available_brands)
-    if base_brand not in stored_brands:
-        stored_brands = list(dict.fromkeys(list(stored_brands) + [base_brand]))
-    st.session_state[BRAND_SELECTION_KEY] = stored_brands
     brand_selection = st.multiselect(
         "Brands to display",
         options=available_brands,
-        default=stored_brands,
+        default=available_brands,
         help="All brands are selected by default. Adjust to focus analysis if needed.",
-        key=BRAND_SELECTION_KEY,
     )
-    brand_selection = st.session_state.get(BRAND_SELECTION_KEY, available_brands)
     if base_brand not in brand_selection:
-        brand_selection = list(dict.fromkeys(list(brand_selection) + [base_brand]))
+        brand_selection.append(base_brand)
     ordered_unique: list[str] = []
     for brand in available_brands:
         if brand in brand_selection and brand not in ordered_unique:
             ordered_unique.append(brand)
     brand_selection = ordered_unique or [base_brand]
-    initial_visible_brands = set(brand_selection)
+    initial_visible_brands: set[str] = set(default_brand_selection or [base_brand])
+    initial_visible_brands.add(base_brand)
 
     if date_col != "(none)" and working_df[date_col].notna().any():
         date_series = (
