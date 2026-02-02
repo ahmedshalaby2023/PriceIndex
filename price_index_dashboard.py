@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 from itertools import cycle
 from typing import Any, Iterable, Optional
+from difflib import get_close_matches
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,11 @@ SUPPORTED_EXTENSIONS = {".xlsb", ".xlsx", ".xls"}
 FOCUS_BRANDS = ["Atyab", "Chikitita", "Meatland"]
 BRANDS_SHEET_NAME = "Brands"
 DEFAULT_ITEM_DESCRIPTION = "Meat_Chilled Luncheon_Retail_5Kg_1_Luncheon"
+ITEM_SELECT_KEY = "price_index_item_select"
+ITEM_INPUT_KEY = "price_index_item_input"
+ITEM_LAST_SELECTED_KEY = "price_index_item_last_selected"
+SHOW_PRICE_LABELS_KEY = "price_index_show_price_labels"
+BRAND_SELECTION_KEY = "price_index_brand_selection"
 BRAND_ALIASES: dict[str, tuple[str, ...]] = {
     "Atyab": ("atyab",),
     "Chikitita": ("chikitita", "chikitia"),
@@ -331,7 +337,42 @@ selected_item = st.selectbox(
     "Item description",
     options=available_items,
     index=default_item_index,
+    key=ITEM_SELECT_KEY,
+    help="Choose a starting item. You can tweak the text below to jump to a similar description without retyping it from scratch.",
 )
+
+if st.session_state.get(ITEM_LAST_SELECTED_KEY) != selected_item:
+    st.session_state[ITEM_INPUT_KEY] = selected_item
+    st.session_state[ITEM_LAST_SELECTED_KEY] = selected_item
+
+editable_item = st.text_input(
+    "Refine item description",
+    key=ITEM_INPUT_KEY,
+    help="Edit the selected description. A close match from the data will be used automatically.",
+).strip()
+
+resolved_item = selected_item
+if editable_item:
+    if editable_item in available_items:
+        resolved_item = editable_item
+    else:
+        partial_matches = [item for item in available_items if editable_item.lower() in item.lower()]
+        if partial_matches:
+            resolved_item = partial_matches[0]
+        else:
+            close_match = get_close_matches(editable_item, available_items, n=1, cutoff=0.0)
+            if close_match:
+                resolved_item = close_match[0]
+            else:
+                st.warning("No item matches the text you entered. Using the original selection.")
+
+if resolved_item != selected_item:
+    st.session_state[ITEM_SELECT_KEY] = resolved_item
+    selected_item = resolved_item
+    st.session_state[ITEM_INPUT_KEY] = resolved_item
+    st.session_state[ITEM_LAST_SELECTED_KEY] = resolved_item
+else:
+    selected_item = resolved_item
 
 item_mask = working_df[item_col].astype(str) == selected_item
 item_subset = working_df.loc[item_mask].copy()
@@ -441,21 +482,32 @@ st.caption(" | ".join(caption_parts))
 
 with filters_container:
     default_brand_selection = _default_brand_window(available_brands, base_brand)
+    stored_brands = st.session_state.get(BRAND_SELECTION_KEY)
+    if stored_brands is None:
+        stored_brands = list(available_brands)
+    else:
+        stored_brands = [brand for brand in stored_brands if brand in available_brands]
+        if not stored_brands:
+            stored_brands = list(available_brands)
+    if base_brand not in stored_brands:
+        stored_brands = list(dict.fromkeys(list(stored_brands) + [base_brand]))
+    st.session_state[BRAND_SELECTION_KEY] = stored_brands
     brand_selection = st.multiselect(
         "Brands to display",
         options=available_brands,
-        default=available_brands,
+        default=stored_brands,
         help="All brands are selected by default. Adjust to focus analysis if needed.",
+        key=BRAND_SELECTION_KEY,
     )
+    brand_selection = st.session_state.get(BRAND_SELECTION_KEY, available_brands)
     if base_brand not in brand_selection:
-        brand_selection.append(base_brand)
+        brand_selection = list(dict.fromkeys(list(brand_selection) + [base_brand]))
     ordered_unique: list[str] = []
     for brand in available_brands:
         if brand in brand_selection and brand not in ordered_unique:
             ordered_unique.append(brand)
     brand_selection = ordered_unique or [base_brand]
-    initial_visible_brands: set[str] = set(default_brand_selection or [base_brand])
-    initial_visible_brands.add(base_brand)
+    initial_visible_brands = set(brand_selection)
 
     if date_col != "(none)" and working_df[date_col].notna().any():
         date_series = (
@@ -578,6 +630,18 @@ if date_col != "(none)" and date_col in filtered.columns and filtered[date_col].
     base_brand_data = base_brand_data.sort_values(by=date_col)
 
 st.subheader(f"Item: {selected_item}")
+
+controls_col, _ = st.columns([1, 6])
+with controls_col:
+    if SHOW_PRICE_LABELS_KEY not in st.session_state:
+        st.session_state[SHOW_PRICE_LABELS_KEY] = True
+    st.checkbox(
+        "Show price values in chart labels",
+        key=SHOW_PRICE_LABELS_KEY,
+        help="Toggle per-kg price information inside chart annotations.",
+    )
+    show_price_labels = st.session_state[SHOW_PRICE_LABELS_KEY]
+
 st.caption(
     "Adjust selections in the sidebar to refine the analysis. Values are aggregated by brand and date where applicable."
 )
@@ -715,7 +779,7 @@ if date_col != "(none)" and filtered[date_col].notna().any():
                     per_kg_value = None
                     if idx < len(x_values):
                         per_kg_value = _lookup_per_kg_value(trace.name, x_values[idx])
-                    if per_kg_value is not None and not pd.isna(per_kg_value):
+                    if show_price_labels and per_kg_value is not None and not pd.isna(per_kg_value):
                         per_kg_label = _format_price_per_kg_label(per_kg_value)
                         value_text = f"{value_text} ({per_kg_label})"
                     formatted_text.append(f"{label_prefix}{value_text}")
@@ -744,7 +808,11 @@ if date_col != "(none)" and filtered[date_col].notna().any():
         brand_order = latest_relative[brand_col].tolist()
         latest_relative["price_per_kg_value"] = latest_relative[brand_col].map(brand_latest_per_kg.get)
         latest_relative["display_text"] = latest_relative.apply(
-            lambda row: _format_percent_with_per_kg(row["relative_value"], row["price_per_kg_value"]),
+            lambda row: (
+                _format_percent_with_per_kg(row["relative_value"], row["price_per_kg_value"])
+                if show_price_labels
+                else _format_percent_with_per_kg(row["relative_value"], None)
+            ),
             axis=1,
         )
         st.markdown("### Latest recorded price index (Δ vs base)")
@@ -811,7 +879,11 @@ if date_col != "(none)" and filtered[date_col].notna().any():
         brand_order = latest_dates[brand_col].tolist()
         latest_dates["price_per_kg_value"] = latest_dates[brand_col].map(brand_latest_per_kg.get)
         latest_dates["display_text"] = latest_dates.apply(
-            lambda row: _format_percent_with_per_kg(row[selected_price_cols[0]], row["price_per_kg_value"]),
+            lambda row: (
+                _format_percent_with_per_kg(row[selected_price_cols[0]], row["price_per_kg_value"])
+                if show_price_labels
+                else _format_percent_with_per_kg(row[selected_price_cols[0]], None)
+            ),
             axis=1,
         )
         st.markdown("### Latest recorded price index")
