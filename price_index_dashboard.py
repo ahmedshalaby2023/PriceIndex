@@ -14,6 +14,15 @@ import streamlit as st
 
 
 st.set_page_config(page_title="Price Index Explorer", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* Reduce default padding for Streamlit dataframes when showing styled HTML */
+    .brand-snapshot-table td { padding: 0.4rem 0.6rem !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 DEFAULT_SHEET = "Market"
 SUPPORTED_EXTENSIONS = {".xlsb", ".xlsx", ".xls"}
@@ -663,20 +672,54 @@ if selected_price_cols:
     if primary_metric in display_summary.columns:
         display_summary = display_summary.sort_values(primary_metric, ascending=False)
 
+primary_price_col = selected_price_cols[0] if selected_price_cols else None
+metric_map: list[tuple[str, str]] = []
+if primary_price_col is not None:
+    metric_map.append(("Avg price index", f"Avg {primary_price_col}"))
+    metric_map.append(("Latest price index", f"Latest {primary_price_col}"))
+    delta_col_name = f"Δ vs {base_brand} ({primary_price_col})"
+    if delta_col_name in display_summary.columns:
+        metric_map.append((f"Δ vs {base_brand}", delta_col_name))
+
+selected_metrics = [(label, col) for label, col in metric_map if col in display_summary.columns]
+if selected_metrics:
+    metric_labels, metric_columns = zip(*selected_metrics)
+    pivot_summary = display_summary.loc[:, metric_columns].T
+    pivot_summary.index = metric_labels
+else:
+    pivot_summary = display_summary.T
+
 def _format_percent_cell(val: float | int | None) -> str:
     if pd.isna(val):
         return "—"
     return f"{val:.0%}"
 
 
-formatters = {col: _format_percent_cell for col in display_summary.columns}
+def _metric_with_icon(val: float | int | None) -> str:
+    if pd.isna(val):
+        return "—"
+    try:
+        numeric_val = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if numeric_val > 0:
+        icon = "<span style='color:#2e7d32;'>▲</span>"
+    elif numeric_val < 0:
+        icon = "<span style='color:#c62828;'>▼</span>"
+    else:
+        icon = ""
+    percent_text = f"{numeric_val:.0%}"
+    return f"{icon} {percent_text}".strip()
 
-def _highlight_base(row: pd.Series) -> list[str]:
-    if row.name == base_brand:
-        return ["background-color: #fff59d; font-weight: 600" for _ in row]
-    return ["" for _ in row]
 
-styled_summary = display_summary.style.format(formatters).apply(_highlight_base, axis=1)
+formatters = {col: _metric_with_icon for col in pivot_summary.columns}
+
+def _highlight_base_column(col: pd.Series) -> list[str]:
+    if col.name == base_brand:
+        return ["background-color: #fff59d; font-weight: 600" for _ in col]
+    return ["" for _ in col]
+
+styled_summary = pivot_summary.style.format(formatters).apply(_highlight_base_column, axis=0)
 
 highlight_color = "#0d47a1"
 muted_color = "#b0bec5"
@@ -745,20 +788,30 @@ if date_col != "(none)" and filtered[date_col].notna().any():
             fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111111"))
         fig.update_traces(
             texttemplate="%{text}",
-            textposition="top center",
+            textposition="middle center",
             textfont=dict(size=11, color="#111111"),
             mode="lines+markers+text",
         )
         fig.update_layout(hovermode="x unified", font=dict(color="#111111"))
         fig.update_xaxes(tickfont=dict(color="#111111"))
-        for trace in fig.data:
+        for trace_index, trace in enumerate(fig.data):
             y_values = trace.y if trace.y is not None else []
             x_values = trace.x if trace.x is not None else []
             formatted_text: list[str] = []
+            text_positions: list[str] = []
+            seen_points: set[tuple[Any, Any]] = set()
             for idx, y in enumerate(y_values):
                 label_prefix = f"{trace.name}: " if idx == 0 else ""
+                x_val = x_values[idx] if idx < len(x_values) else idx
+                point_key = (trace.name, x_val)
+                if point_key in seen_points:
+                    formatted_text.append("")
+                    text_positions.append("top center" if (idx % 2 == 0) else "bottom center")
+                    continue
+                seen_points.add(point_key)
                 if pd.isna(y):
                     formatted_text.append(f"{trace.name}" if idx == 0 else "")
+                    text_positions.append("top center" if (idx % 2 == 0) else "bottom center")
                 else:
                     try:
                         value_text = f"{float(y):.1%}"
@@ -771,11 +824,13 @@ if date_col != "(none)" and filtered[date_col].notna().any():
                         per_kg_label = _format_price_per_kg_label(per_kg_value)
                         value_text = f"{value_text} ({per_kg_label})"
                     formatted_text.append(f"{label_prefix}{value_text}")
+                    text_positions.append("top center" if (idx % 2 == 0) else "bottom center")
             if formatted_text:
                 trace.text = formatted_text
             else:
                 x_values = trace.x if trace.x is not None else []
                 trace.text = [str(trace.name)] + [""] * (len(x_values) - 1)
+                text_positions = ["top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(trace.text))]
             color = brand_color_map.get(trace.name, muted_color)
             if trace.name == base_brand:
                 trace.update(line=dict(width=4, color=color), marker=dict(size=10, color=color))
@@ -783,6 +838,11 @@ if date_col != "(none)" and filtered[date_col].notna().any():
                 trace.update(line=dict(width=2, color=color), marker=dict(size=6, color=color), opacity=0.75)
             if trace.name not in initial_visible_brands:
                 trace.visible = "legendonly"
+            if len(text_positions) < len(trace.text):
+                text_positions.extend([
+                    "top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(text_positions), len(trace.text))
+                ])
+            trace.update(textposition=text_positions, textfont=dict(size=11, color=color))
         st.plotly_chart(fig, use_container_width=True)
 
     relative_primary = relative_traces.get(selected_price_cols[0])
@@ -932,7 +992,10 @@ else:
     st.info("Date column not provided or contains no valid timestamps. Showing aggregated view only.")
 
 with st.expander("Brand snapshot", expanded=False):
-    st.dataframe(styled_summary, use_container_width=True)
+    st.write(
+        styled_summary.to_html(classes="brand-snapshot-table", escape=False),
+        unsafe_allow_html=True,
+    )
 
 with st.expander("Show filtered records"):
     st.dataframe(filtered, use_container_width=True, hide_index=True)
