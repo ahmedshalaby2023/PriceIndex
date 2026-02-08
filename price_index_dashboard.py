@@ -1,6 +1,7 @@
 """Streamlit app for analyzing item price indices by brand and date."""
 from __future__ import annotations
 
+from datetime import timedelta
 from io import BytesIO
 from pathlib import Path
 from itertools import cycle
@@ -10,6 +11,7 @@ from difflib import get_close_matches
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -157,6 +159,38 @@ def _format_percent_with_per_kg(percent_val: float | int | None, per_kg_val: flo
         return percent_text
     per_kg_text = _format_price_per_kg_label(per_kg_val)
     return f"{percent_text} ({per_kg_text})"
+
+
+def _highlight_base_column(col: pd.Series) -> list[str]:
+    if col.name == base_brand:
+        return ["background-color: #fff59d; font-weight: 600" for _ in col]
+    return ["" for _ in col]
+
+
+def _format_customer_count(value: Any) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    try:
+        count_int = int(round(float(value)))
+    except (TypeError, ValueError):
+        return ""
+    if count_int <= 0:
+        return ""
+    return "1 customer" if count_int == 1 else f"{count_int} customers"
+
+
+def _customer_border_color(value: Any, fallback_color: str) -> str:
+    if value is None or pd.isna(value):
+        return fallback_color
+    try:
+        count_int = int(round(float(value)))
+    except (TypeError, ValueError):
+        return fallback_color
+    if count_int == 1:
+        return "#ff1744"
+    if count_int >= 3:
+        return "#1e88e5"
+    return fallback_color
 
 
 def _default_brand_window(brands: list[str], focus: str) -> list[str]:
@@ -523,7 +557,17 @@ with filters_container:
                 start_date, end_date = st.select_slider(
                     "Date range",
                     options=date_options,
-                    value=(date_options[0], date_options[-1]),
+                    value=(
+                        next(
+                            (
+                                dt
+                                for dt in date_options
+                                if dt >= (date_options[-1] - timedelta(days=30))
+                            ),
+                            date_options[0],
+                        ),
+                        date_options[-1],
+                    ),
                     format_func=lambda dt: dt.strftime("%Y-%m-%d"),
                 )
                 enable_single_date = st.checkbox(
@@ -646,84 +690,59 @@ st.caption(
 if date_col != "(none)" and filtered[date_col].notna().any():
     filtered = filtered.sort_values(by=[date_col, brand_col])
 
-price_summary_rows = []
-for brand_name, brand_df in filtered.groupby(brand_col):
-    summary = {"Brand": brand_name}
-    for price_col in selected_price_cols:
-        col_values = brand_df[price_col].dropna()
-        summary[f"Avg {price_col}"] = col_values.mean() if not col_values.empty else np.nan
-        summary[f"Latest {price_col}"] = col_values.iloc[-1] if not col_values.empty else np.nan
-    price_summary_rows.append(summary)
+snapshot_df = working_df.copy()
+if channel_col != "(none)" and channel_selection:
+    snapshot_df = snapshot_df[snapshot_df[channel_col].astype(str).isin(channel_selection)]
+if customer_col != "(none)" and customer_selection:
+    snapshot_df = snapshot_df[snapshot_df[customer_col].astype(str).isin(customer_selection)]
+if brand_selection:
+    snapshot_df = snapshot_df[snapshot_df[brand_col].astype(str).isin(brand_selection)]
+if date_col != "(none)" and start_date and end_date:
+    snapshot_df = snapshot_df[snapshot_df[date_col].dt.date.between(start_date, end_date)]
+if date_col != "(none)" and selected_date is not None:
+    snapshot_df = snapshot_df[snapshot_df[date_col].dt.date == selected_date]
 
-summary_df = pd.DataFrame(price_summary_rows)
-if base_brand and base_brand in summary_df["Brand"].values:
-    ref_rows = summary_df[summary_df["Brand"] == base_brand]
-    for price_col in selected_price_cols:
-        ref_value = ref_rows[f"Latest {price_col}"].iloc[0]
-        relative_col = f"Δ vs {base_brand} ({price_col})"
-        if pd.notna(ref_value) and ref_value != 0:
-            summary_df[relative_col] = summary_df[f"Latest {price_col}"] / ref_value - 1
-        else:
-            summary_df[relative_col] = np.nan
+items_index = (
+    snapshot_df[item_col]
+    .dropna()
+    .astype(str)
+    .sort_values()
+    .unique()
+    .tolist()
+)
 
-display_summary = summary_df.set_index("Brand")
-if selected_price_cols:
-    primary_metric = f"Latest {selected_price_cols[0]}"
-    if primary_metric in display_summary.columns:
-        display_summary = display_summary.sort_values(primary_metric, ascending=False)
+pivot_summary = pd.DataFrame(index=items_index)
+for brand_name in brand_selection:
+    price_col = brand_price_per_kg_map.get(brand_name)
+    if price_col is None and generic_price_per_kg_col:
+        price_col = generic_price_per_kg_col
+    if price_col is None or price_col not in working_df.columns:
+        continue
+    brand_mask = snapshot_df[brand_col].astype(str) == brand_name
+    brand_subset = snapshot_df.loc[brand_mask, [item_col, price_col]].copy()
+    if brand_subset.empty:
+        continue
+    brand_subset[item_col] = brand_subset[item_col].astype(str)
+    avg_by_item = brand_subset.groupby(item_col)[price_col].mean()
+    pivot_summary[brand_name] = avg_by_item
 
-primary_price_col = selected_price_cols[0] if selected_price_cols else None
-metric_map: list[tuple[str, str]] = []
-if primary_price_col is not None:
-    metric_map.append(("Avg price index", f"Avg {primary_price_col}"))
-    metric_map.append(("Latest price index", f"Latest {primary_price_col}"))
-    delta_col_name = f"Δ vs {base_brand} ({primary_price_col})"
-    if delta_col_name in display_summary.columns:
-        metric_map.append((f"Δ vs {base_brand}", delta_col_name))
+pivot_summary.index.name = "Item description"
+pivot_summary = pivot_summary.dropna(how="all")
+present_columns = [brand for brand in brand_selection if brand in pivot_summary.columns]
+other_columns = [col for col in pivot_summary.columns if col not in present_columns]
+pivot_summary = pivot_summary.loc[:, present_columns + other_columns]
 
-selected_metrics = [(label, col) for label, col in metric_map if col in display_summary.columns]
-if selected_metrics:
-    metric_labels, metric_columns = zip(*selected_metrics)
-    pivot_summary = display_summary.loc[:, metric_columns].T
-    pivot_summary.index = metric_labels
-else:
-    pivot_summary = display_summary.T
+formatters = {col: _format_price_per_kg_label for col in pivot_summary.columns}
 
-def _format_percent_cell(val: float | int | None) -> str:
-    if pd.isna(val):
-        return "—"
-    return f"{val:.0%}"
-
-
-def _metric_with_icon(val: float | int | None) -> str:
-    if pd.isna(val):
-        return "—"
-    try:
-        numeric_val = float(val)
-    except (TypeError, ValueError):
-        return str(val)
-    if numeric_val > 0:
-        icon = "<span style='color:#2e7d32;'>▲</span>"
-    elif numeric_val < 0:
-        icon = "<span style='color:#c62828;'>▼</span>"
-    else:
-        icon = ""
-    percent_text = f"{numeric_val:.0%}"
-    return f"{icon} {percent_text}".strip()
-
-
-formatters = {col: _metric_with_icon for col in pivot_summary.columns}
-
-def _highlight_base_column(col: pd.Series) -> list[str]:
-    if col.name == base_brand:
-        return ["background-color: #fff59d; font-weight: 600" for _ in col]
-    return ["" for _ in col]
+if not pivot_summary.empty:
+    if base_brand in pivot_summary.columns:
+        pivot_summary = pivot_summary.sort_values(by=base_brand, ascending=False)
 
 styled_summary = pivot_summary.style.format(formatters).apply(_highlight_base_column, axis=0)
 
 highlight_color = "#0d47a1"
 muted_color = "#b0bec5"
-base_bar_color = "#fdd835"
+base_bar_color = "#1b5e20"
 
 palette = px.colors.qualitative.Safe + px.colors.qualitative.Pastel
 color_cycle = cycle(palette)
@@ -753,6 +772,12 @@ if date_col != "(none)" and filtered[date_col].notna().any() and base_brand in f
         pivot = pivot.loc[valid_index]
         base_series = base_series.loc[valid_index]
         relative = pivot.divide(base_series, axis=0) - 1
+        first_base_value = base_series.iloc[0] if not base_series.empty else np.nan
+        if pd.notna(first_base_value) and not np.isclose(first_base_value, 0.0):
+            base_trend = (base_series / first_base_value) - 1
+        else:
+            base_trend = base_series.pct_change().fillna(0)
+        relative[base_brand] = base_trend
         relative = relative.replace([np.inf, -np.inf], np.nan).reset_index()
         relative = relative.melt(id_vars=[date_col], var_name=brand_col, value_name="relative_value")
         relative = relative.dropna(subset=["relative_value"])
@@ -833,9 +858,9 @@ if date_col != "(none)" and filtered[date_col].notna().any():
                 text_positions = ["top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(trace.text))]
             color = brand_color_map.get(trace.name, muted_color)
             if trace.name == base_brand:
-                trace.update(line=dict(width=4, color=color), marker=dict(size=10, color=color))
+                trace.update(line=dict(width=2, color=color), marker=dict(size=10, color=color))
             else:
-                trace.update(line=dict(width=2, color=color), marker=dict(size=6, color=color), opacity=0.75)
+                trace.update(line=dict(width=1, color=color), marker=dict(size=6, color=color), opacity=0.75)
             if trace.name not in initial_visible_brands:
                 trace.visible = "legendonly"
             if len(text_positions) < len(trace.text):
@@ -845,17 +870,236 @@ if date_col != "(none)" and filtered[date_col].notna().any():
             trace.update(textposition=text_positions, textfont=dict(size=11, color=color))
         st.plotly_chart(fig, use_container_width=True)
 
+    per_kg_trend_rows: list[pd.DataFrame] = []
+    if brand_per_kg_columns and date_col != "(none)" and filtered[date_col].notna().any():
+        for brand in brand_selection:
+            per_kg_col = brand_per_kg_columns.get(brand)
+            if per_kg_col is None:
+                continue
+            brand_slice = filtered.loc[
+                filtered[brand_col].astype(str) == brand, [date_col, per_kg_col]
+            ].dropna()
+            if brand_slice.empty:
+                continue
+            daily_avg = (
+                brand_slice.groupby(date_col, as_index=False)[per_kg_col]
+                .mean()
+                .rename(columns={per_kg_col: "price_per_kg"})
+            )
+            daily_avg[brand_col] = brand
+            per_kg_trend_rows.append(daily_avg)
+
+    customer_count_pivot = None
+    if per_kg_trend_rows:
+        per_kg_trend_df = pd.concat(per_kg_trend_rows, ignore_index=True)
+        per_kg_trend_df = per_kg_trend_df.sort_values(date_col)
+        per_kg_pivot = (
+            per_kg_trend_df.pivot_table(
+                index=date_col,
+                columns=brand_col,
+                values="price_per_kg",
+                aggfunc="mean",
+            )
+            .sort_index()
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna(how="all")
+        )
+        if "customer_count" in per_kg_trend_df.columns:
+            customer_count_pivot = (
+                per_kg_trend_df.pivot_table(
+                    index=date_col,
+                    columns=brand_col,
+                    values="customer_count",
+                    aggfunc="first",
+                )
+                .reindex(per_kg_pivot.index)
+                .sort_index()
+            )
+        if not per_kg_pivot.empty:
+            price_fig = go.Figure()
+            base_series_per_date = per_kg_pivot[base_brand] if base_brand in per_kg_pivot.columns else None
+            other_max_per_date = None
+            if base_series_per_date is not None:
+                other_cols = [col for col in per_kg_pivot.columns if col != base_brand]
+                if other_cols:
+                    other_max_per_date = per_kg_pivot[other_cols].max(axis=1)
+            for brand in per_kg_pivot.columns:
+                series = per_kg_pivot[brand].dropna()
+                if series.empty:
+                    continue
+                color = brand_color_map.get(brand, muted_color)
+                marker_colors: list[str] | str = color
+                count_values: np.ndarray | list[Any]
+                if customer_count_pivot is not None and brand in customer_count_pivot.columns:
+                    aligned_counts = customer_count_pivot[brand].reindex(series.index)
+                    count_values = aligned_counts.values
+                else:
+                    count_values = [None] * len(series)
+                marker_border_colors: list[str] = []
+                if base_series_per_date is not None and brand != base_brand:
+                    aligned_base = base_series_per_date.reindex(series.index)
+                    label_text = []
+                    marker_colors = []
+                    for val, base_val, count_val in zip(series.values, aligned_base.values, count_values):
+                        count_text = _format_customer_count(count_val)
+                        border_color = _customer_border_color(count_val, color)
+                        if pd.isna(base_val):
+                            text_value = f"{val:,.2f}"
+                            marker_colors.append(color)
+                        else:
+                            diff_val = float(val) - float(base_val)
+                            if float(base_val) == 0:
+                                text_value = f"{val:,.2f} (n/a)"
+                            else:
+                                diff_pct = (diff_val / float(base_val)) * 100.0
+                                text_value = f"{val:,.2f} ({diff_pct:+.1f}%)"
+                            marker_colors.append("#ff1744" if diff_val < 0 else color)
+                        marker_border_colors.append(border_color)
+                        if count_text:
+                            text_value = f"{text_value}<br>{count_text}"
+                        label_text.append(text_value)
+                else:
+                    label_text = []
+                    if brand == base_brand and other_max_per_date is not None:
+                        aligned_other_max = other_max_per_date.reindex(series.index)
+                        marker_colors = []
+                        for val, other_val, count_val in zip(series.values, aligned_other_max.values, count_values):
+                            if pd.isna(other_val):
+                                marker_colors.append(color)
+                            else:
+                                marker_colors.append("#00e676" if float(val) < float(other_val) else color)
+                            count_text = _format_customer_count(count_val)
+                            marker_border_colors.append(_customer_border_color(count_val, color))
+                            text_value = f"{val:,.2f}"
+                            if count_text:
+                                text_value = f"{text_value}<br>{count_text}"
+                            label_text.append(text_value)
+                    else:
+                        marker_colors = [color] * len(series)
+                        for val, count_val in zip(series.values, count_values):
+                            count_text = _format_customer_count(count_val)
+                            marker_border_colors.append(_customer_border_color(count_val, color))
+                            text_value = f"{val:,.2f}"
+                            if count_text:
+                                text_value = f"{text_value}<br>{count_text}"
+                            label_text.append(text_value)
+                    if marker_border_colors and len(marker_border_colors) < len(label_text):
+                        marker_border_colors.extend([
+                            _customer_border_color(None, color)
+                            for _ in range(len(label_text) - len(marker_border_colors))
+                        ])
+                    elif not marker_border_colors:
+                        marker_border_colors = [
+                            _customer_border_color(count_val, color) for count_val in count_values
+                        ]
+                label_positions = [
+                    "top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(label_text))
+                ]
+                price_fig.add_trace(
+                    go.Scatter(
+                        x=series.index,
+                        y=series.values,
+                        mode="lines+markers+text",
+                        name=brand,
+                        visible=True if brand == base_brand else "legendonly",
+                        text=label_text,
+                        textposition=label_positions,
+                        textfont=dict(size=11, color=color),
+                        line=dict(
+                            color=color,
+                            width=2 if brand == base_brand else 1,
+                        ),
+                        marker=dict(
+                            size=9 if brand == base_brand else 7,
+                            color=marker_colors,
+                            line=dict(
+                                color=marker_border_colors,
+                                width=2,
+                            ),
+                        ),
+                        hovertemplate="<b>%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Price per KG: %{y:,.2f}<extra></extra>",
+                    )
+                )
+            price_fig.update_layout(
+                title="Price per KG promoted trend",
+                yaxis_title="Price per KG",
+                xaxis_title="Date",
+                hovermode="x unified",
+                font=dict(color="#111111"),
+                legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+            )
+            price_fig.update_yaxes(tickprefix="", separatethousands=True)
+            price_fig.update_xaxes(tickformat="%Y-%m-%d")
+            st.plotly_chart(price_fig, use_container_width=True)
+
+            if base_series_per_date is not None:
+                response_rows: list[dict[str, object]] = []
+                for competitor in [col for col in per_kg_pivot.columns if col != base_brand]:
+                    aligned = pd.concat(
+                        [
+                            base_series_per_date.rename("base"),
+                            per_kg_pivot[competitor].rename("competitor"),
+                        ],
+                        axis=1,
+                    ).dropna()
+                    if aligned.empty:
+                        continue
+                    aligned = aligned.sort_index()
+                    diff = aligned["base"] - aligned["competitor"]
+
+                    last_above_date = None
+                    event_above_date = None
+                    event_below_date = None
+                    for current_date, current_diff in diff.items():
+                        if current_diff > 0:
+                            last_above_date = current_date
+                        elif current_diff < 0 and last_above_date is not None:
+                            event_above_date = last_above_date
+                            event_below_date = current_date
+                            last_above_date = None
+
+                    if event_above_date is not None and event_below_date is not None:
+                        response_days = (event_below_date - event_above_date).days
+                        response_rows.append(
+                            {
+                                "Brand": competitor,
+                                "Above date": event_above_date,
+                                "Below date": event_below_date,
+                                "Response time (days)": int(response_days),
+                            }
+                        )
+
+                if response_rows:
+                    response_df = pd.DataFrame(response_rows).sort_values(
+                        "Response time (days)", ascending=True
+                    )
+                    st.markdown("#### Response time to compete")
+                    st.dataframe(
+                        response_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Above date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                            "Below date": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                            "Response time (days)": st.column_config.NumberColumn(format="%d"),
+                        },
+                    )
+
     relative_primary = relative_traces.get(selected_price_cols[0])
     if relative_primary is not None and not relative_primary.empty:
-        latest_relative = (
-            relative_primary.sort_values(date_col)
-            .groupby(brand_col, as_index=False)
-            .tail(1)
+        avg_relative = (
+            relative_primary.groupby(brand_col, as_index=False)["relative_value"].mean()
+            .sort_values("relative_value", ascending=False)
         )
-        latest_relative = latest_relative.sort_values("relative_value", ascending=False)
-        brand_order = latest_relative[brand_col].tolist()
-        latest_relative["price_per_kg_value"] = latest_relative[brand_col].map(brand_latest_per_kg.get)
-        latest_relative["display_text"] = latest_relative.apply(
+        brand_order = avg_relative[brand_col].tolist()
+        brand_avg_per_kg: dict[str, float] = {}
+        for brand, per_kg_col in brand_per_kg_columns.items():
+            if per_kg_col in filtered.columns:
+                per_values = filtered.loc[filtered[brand_col].astype(str) == brand, per_kg_col].dropna()
+                if not per_values.empty:
+                    brand_avg_per_kg[brand] = float(per_values.mean())
+        avg_relative["price_per_kg_value"] = avg_relative[brand_col].map(brand_avg_per_kg.get)
+        avg_relative["display_text"] = avg_relative.apply(
             lambda row: (
                 _format_percent_with_per_kg(row["relative_value"], row["price_per_kg_value"])
                 if show_price_labels
@@ -863,17 +1107,16 @@ if date_col != "(none)" and filtered[date_col].notna().any():
             ),
             axis=1,
         )
-        st.markdown("### Latest recorded price index (Δ vs base)")
-        latest_date_value = relative_primary[date_col].max()
-        if pd.notna(latest_date_value):
-            st.caption(f"Latest observation date across selected brands: {latest_date_value:%Y-%m-%d}")
+        st.markdown("### Average price index (Δ vs base)")
+        if start_date and end_date:
+            st.caption(f"Average across selected date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")
         bar_fig = px.bar(
-            latest_relative,
+            avg_relative,
             x=brand_col,
             y="relative_value",
             text="display_text",
             labels={brand_col: "Brand", "relative_value": "Δ vs base"},
-            title=f"{selected_price_cols[0]} Δ vs {base_brand} (latest)",
+            title=f"{selected_price_cols[0]} Δ vs {base_brand} (avg)",
             color=brand_col,
             color_discrete_map=brand_color_map,
         )
@@ -896,8 +1139,8 @@ if date_col != "(none)" and filtered[date_col].notna().any():
             ),
             font=dict(color="#111111"),
         )
-        if base_brand in latest_relative[brand_col].values:
-            base_row = latest_relative.loc[latest_relative[brand_col] == base_brand]
+        if base_brand in avg_relative[brand_col].values:
+            base_row = avg_relative.loc[avg_relative[brand_col] == base_brand]
             if not base_row.empty:
                 base_value = float(base_row["relative_value"].iloc[0])
                 bar_fig.add_annotation(
@@ -917,16 +1160,21 @@ if date_col != "(none)" and filtered[date_col].notna().any():
                 )
         st.plotly_chart(bar_fig, use_container_width=True)
     else:
-        latest_dates = (
-            filtered[[date_col, brand_col] + selected_price_cols]
-            .sort_values(date_col)
-            .groupby(brand_col, as_index=False)
-            .tail(1)
+        avg_dates = (
+            filtered[[brand_col] + selected_price_cols]
+            .groupby(brand_col, as_index=False)[selected_price_cols[0]]
+            .mean()
+            .sort_values(selected_price_cols[0], ascending=False)
         )
-        latest_dates = latest_dates.sort_values(selected_price_cols[0], ascending=False)
-        brand_order = latest_dates[brand_col].tolist()
-        latest_dates["price_per_kg_value"] = latest_dates[brand_col].map(brand_latest_per_kg.get)
-        latest_dates["display_text"] = latest_dates.apply(
+        brand_order = avg_dates[brand_col].tolist()
+        brand_avg_per_kg: dict[str, float] = {}
+        for brand, per_kg_col in brand_per_kg_columns.items():
+            if per_kg_col in filtered.columns:
+                per_values = filtered.loc[filtered[brand_col].astype(str) == brand, per_kg_col].dropna()
+                if not per_values.empty:
+                    brand_avg_per_kg[brand] = float(per_values.mean())
+        avg_dates["price_per_kg_value"] = avg_dates[brand_col].map(brand_avg_per_kg.get)
+        avg_dates["display_text"] = avg_dates.apply(
             lambda row: (
                 _format_percent_with_per_kg(row[selected_price_cols[0]], row["price_per_kg_value"])
                 if show_price_labels
@@ -934,17 +1182,16 @@ if date_col != "(none)" and filtered[date_col].notna().any():
             ),
             axis=1,
         )
-        st.markdown("### Latest recorded price index")
-        latest_date_value = latest_dates[date_col].max()
-        if pd.notna(latest_date_value):
-            st.caption(f"Latest observation date across selected brands: {latest_date_value:%Y-%m-%d}")
+        st.markdown("### Average price index")
+        if start_date and end_date:
+            st.caption(f"Average across selected date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")
         bar_fig = px.bar(
-            latest_dates,
+            avg_dates,
             x=brand_col,
             y=selected_price_cols[0],
             text="display_text",
             labels={brand_col: "Brand", selected_price_cols[0]: selected_price_cols[0]},
-            title=f"{selected_price_cols[0]} by brand (latest)",
+            title=f"{selected_price_cols[0]} by brand (avg)",
             color=brand_col,
             color_discrete_map=brand_color_map,
         )
@@ -967,8 +1214,8 @@ if date_col != "(none)" and filtered[date_col].notna().any():
             ),
             font=dict(color="#111111"),
         )
-        if base_brand in latest_dates[brand_col].values:
-            base_row = latest_dates.loc[latest_dates[brand_col] == base_brand]
+        if base_brand in avg_dates[brand_col].values:
+            base_row = avg_dates.loc[avg_dates[brand_col] == base_brand]
             if not base_row.empty:
                 base_value = float(base_row[selected_price_cols[0]].iloc[0])
                 bar_fig.add_annotation(
@@ -992,10 +1239,29 @@ else:
     st.info("Date column not provided or contains no valid timestamps. Showing aggregated view only.")
 
 with st.expander("Brand snapshot", expanded=False):
-    st.write(
-        styled_summary.to_html(classes="brand-snapshot-table", escape=False),
-        unsafe_allow_html=True,
-    )
+    if pivot_summary.empty:
+        st.info("No price per KG values are available to summarize for the selected period.")
+    else:
+        export_table = pivot_summary.copy()
+        export_reset = export_table.reset_index()
+        buffer = BytesIO()
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            export_table.to_excel(writer, sheet_name="Price per KG")
+            worksheet = writer.sheets["Price per KG"]
+            for col_idx, column in enumerate(export_reset.columns):
+                max_len = max(export_reset[column].astype(str).map(len).max(), len(str(column)))
+                worksheet.set_column(col_idx, col_idx, max_len + 2)
+        buffer.seek(0)
+        st.download_button(
+            "⬇️ Download prices (Excel)",
+            data=buffer.getvalue(),
+            file_name=f"brand_snapshot_{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        st.write(
+            styled_summary.to_html(classes="brand-snapshot-table", escape=False),
+            unsafe_allow_html=True,
+        )
 
 with st.expander("Show filtered records"):
     st.dataframe(filtered, use_container_width=True, hide_index=True)
