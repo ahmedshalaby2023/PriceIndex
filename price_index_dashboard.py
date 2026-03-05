@@ -1,4 +1,20 @@
-"""Streamlit app for analyzing item price indices by brand and date."""
+"""Streamlit app for analyzing item price indices by brand and date.
+
+Flow
+----
+1. User uploads Excel workbook (Market sheet = transaction data).
+2. App reads helper sheets:
+   - Brands  : one column, lists the base brands we own (e.g. Atyab, Chikitita, Meatland).
+   - Com     : columns [Product, Base Brand, Com] — maps each SKU to its base brand and
+               the competitor brands to show alongside it.
+3. User selects an Item Description from the Market sheet.
+4. App resolves automatically:
+   a. base_brand      → the Base Brand in the Com sheet for that SKU
+                        (must be one of the Brands-sheet brands)
+   b. brand_selection → [base_brand] + Com competitors for that (SKU, base_brand)
+                        filtered to brands that have data in Market
+5. All charts and the snapshot table are rendered for exactly those brands.
+"""
 from __future__ import annotations
 
 from datetime import timedelta
@@ -14,27 +30,26 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Price Index Explorer", layout="wide")
 st.markdown(
-    """
-    <style>
-    /* Reduce default padding for Streamlit dataframes when showing styled HTML */
-    .brand-snapshot-table td { padding: 0.4rem 0.6rem !important; }
-    </style>
-    """,
+    """<style>.brand-snapshot-table td { padding: 0.4rem 0.6rem !important; }</style>""",
     unsafe_allow_html=True,
 )
 
+# ── Constants ─────────────────────────────────────────────────────────────────
 DEFAULT_SHEET = "Market"
 SUPPORTED_EXTENSIONS = {".xlsb", ".xlsx", ".xls"}
-FOCUS_BRANDS = ["Atyab", "Chikitita", "Meatland"]
 BRANDS_SHEET_NAME = "Brands"
-DEFAULT_ITEM_DESCRIPTION = "Meat_Chilled Luncheon_Retail_5Kg_1_Luncheon"
-ITEM_SELECT_KEY = "price_index_item_select"
-ITEM_INPUT_KEY = "price_index_item_input"
-ITEM_LAST_SELECTED_KEY = "price_index_item_last_selected"
-SHOW_PRICE_LABELS_KEY = "price_index_show_price_labels"
+COM_SHEET_NAME = "Com"
+COM_PRODUCT_COL = "Product"
+COM_BASE_BRAND_COL = "Base Brand"
+COM_COMPETITOR_COL = "Com"
+DEFAULT_ITEM = "Meat_Chilled Luncheon_Retail_5Kg_1_Luncheon"
+ITEM_SELECT_KEY = "pie_item_select"
+ITEM_INPUT_KEY = "pie_item_input"
+ITEM_LAST_KEY = "pie_item_last"
+SHOW_LABELS_KEY = "pie_show_labels"
 BRAND_ALIASES: dict[str, tuple[str, ...]] = {
     "Atyab": ("atyab",),
     "Chikitita": ("chikitita", "chikitia"),
@@ -42,1042 +57,858 @@ BRAND_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
-def _normalize(name: str) -> str:
-    return str(name).strip().lower()
+# ── Pure helpers ──────────────────────────────────────────────────────────────
+
+def _norm(s: str) -> str:
+    return str(s).strip().lower()
 
 
-def _match_brand_from_text(text: str) -> Optional[str]:
-    lowered = _normalize(text)
+def _match_brand(text: str, brand_list: list[str]) -> Optional[str]:
+    lowered = _norm(text)
     for brand, aliases in BRAND_ALIASES.items():
-        if any(alias in lowered for alias in aliases):
+        if brand in brand_list and any(a in lowered for a in aliases):
+            return brand
+    for brand in brand_list:
+        if _norm(brand) in lowered:
             return brand
     return None
 
 
-def _build_brand_metric_map(columns: Iterable[str], required_terms: Iterable[str]) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    lowered_terms = [term.lower() for term in required_terms]
-    for column in columns:
-        lowered = _normalize(column)
-        if not all(term in lowered for term in lowered_terms):
+def _brand_col_map(columns: Iterable[str], required: list[str], brand_list: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    low_req = [t.lower() for t in required]
+    for col in columns:
+        low = _norm(col)
+        if not all(t in low for t in low_req):
             continue
-        matched_brand = _match_brand_from_text(column)
-        if matched_brand and matched_brand not in mapping:
-            mapping[matched_brand] = column
-    return mapping
+        b = _match_brand(col, brand_list)
+        if b and b not in out:
+            out[b] = col
+    return out
 
 
-def _build_brand_price_map(columns: Iterable[str]) -> dict[str, str]:
-    """Backward-compatible wrapper for previous helper name."""
-    return _build_brand_metric_map(columns, ["price", "index"])
-
-
-def _find_generic_price_per_kg_column(columns: Iterable[str]) -> Optional[str]:
-    search_term_sequences = [
-        ("price", "per", "kg", "promot"),
-        ("price", "per", "kg"),
-    ]
-    for terms in search_term_sequences:
-        for column in columns:
-            lowered = _normalize(column)
-            if all(term in lowered for term in terms):
-                return column
+def _find_generic_per_kg(columns: Iterable[str]) -> Optional[str]:
+    for terms in [("price", "per", "kg", "promot"), ("price", "per", "kg")]:
+        for col in columns:
+            if all(t in _norm(col) for t in terms):
+                return col
     return None
 
 
-def _guess_column(columns: Iterable[str], keywords: Iterable[str]) -> Optional[str]:
-    for column in columns:
-        lowered = _normalize(column)
-        if all(keyword in lowered for keyword in keywords):
-            return column
+def _guess(columns: Iterable[str], keywords: list[str]) -> Optional[str]:
+    for col in columns:
+        if all(k in _norm(col) for k in keywords):
+            return col
     return None
 
 
-def _guess_item_column(columns: Iterable[str]) -> Optional[str]:
-    for candidate in columns:
-        lowered = _normalize(candidate)
-        if "item" in lowered and ("desc" in lowered or "description" in lowered or "name" in lowered):
-            return candidate
+def _guess_item_col(columns: Iterable[str]) -> Optional[str]:
+    for col in columns:
+        n = _norm(col)
+        if "item" in n and any(x in n for x in ("desc", "description", "name")):
+            return col
     return None
 
 
-def _find_price_columns(df: pd.DataFrame) -> list[str]:
-    matches: list[str] = []
-    for column in df.columns:
-        lowered = _normalize(column)
-        if "price" in lowered and "index" in lowered:
-            matches.append(column)
-    if matches:
-        return matches
-    numeric_columns = df.select_dtypes(include=["number"]).columns.tolist()
-    return numeric_columns
+def _find_price_index_cols(df: pd.DataFrame) -> list[str]:
+    cols = [c for c in df.columns if "price" in _norm(c) and "index" in _norm(c)]
+    return cols or df.select_dtypes(include=["number"]).columns.tolist()
 
 
-def _convert_excel_serial(value: float | int | str | None) -> pd.Timestamp | pd.NaT:
-    if value is None:
-        return pd.NaT
+def _excel_serial(v: Any) -> pd.Timestamp:
     try:
-        num = float(value)
+        num = float(v)
     except (TypeError, ValueError):
         return pd.NaT
     if not np.isfinite(num):
         return pd.NaT
-    if num < 59:
-        base = pd.Timestamp("1899-12-30")
-    else:
-        base = pd.Timestamp("1899-12-30")
-    days = pd.to_timedelta(num, unit="D")
-    return base + days
+    return pd.Timestamp("1899-12-30") + pd.to_timedelta(num, unit="D")
 
 
-def _normalize_percent_series(series: pd.Series) -> pd.Series:
-    numeric = pd.to_numeric(series, errors="coerce")
-    valid = numeric.dropna()
-    if valid.empty:
-        return numeric
-    median = valid.median()
-    if median > 2:
-        numeric = numeric / 100.0
-    return numeric
+def _norm_pct(s: pd.Series) -> pd.Series:
+    num = pd.to_numeric(s, errors="coerce")
+    valid = num.dropna()
+    if not valid.empty and valid.median() > 2:
+        num = num / 100.0
+    return num
 
 
-def _format_price_per_kg_label(val: float | int | None) -> str:
-    if val is None or pd.isna(val):
+def _fmt_kg(v: Any) -> str:
+    if v is None or pd.isna(v):
         return "—"
-    return f"{float(val):,.2f}"
+    return f"{float(v):,.2f}"
 
 
-def _format_percent_with_per_kg(percent_val: float | int | None, per_kg_val: float | int | None) -> str:
-    if percent_val is None or pd.isna(percent_val):
-        percent_text = "—"
-    else:
-        try:
-            percent_text = f"{float(percent_val):.1%}"
-        except (TypeError, ValueError):
-            percent_text = str(percent_val)
-    if per_kg_val is None or pd.isna(per_kg_val):
-        return percent_text
-    per_kg_text = _format_price_per_kg_label(per_kg_val)
-    return f"{percent_text} ({per_kg_text})"
-
-
-def _highlight_base_column(col: pd.Series) -> list[str]:
-    if col.name == base_brand:
-        return ["background-color: #fff59d; font-weight: 600" for _ in col]
-    return ["" for _ in col]
-
-
-def _format_customer_count(value: Any) -> str:
-    if value is None or pd.isna(value):
-        return ""
+def _fmt_pct_kg(pct: Any, kg: Any) -> str:
     try:
-        count_int = int(round(float(value)))
+        p = f"{float(pct):.1%}" if pct is not None and not pd.isna(pct) else "—"
+    except (TypeError, ValueError):
+        p = str(pct)
+    return p if (kg is None or pd.isna(kg)) else f"{p} ({_fmt_kg(kg)})"
+
+
+def _fmt_customers(v: Any) -> str:
+    try:
+        n = int(round(float(v)))
     except (TypeError, ValueError):
         return ""
-    if count_int <= 0:
+    if n <= 0:
         return ""
-    return "1 customer" if count_int == 1 else f"{count_int} customers"
+    return "1 customer" if n == 1 else f"{n} customers"
 
 
-def _customer_border_color(value: Any, fallback_color: str) -> str:
-    if value is None or pd.isna(value):
-        return fallback_color
+def _border_color(v: Any, fallback: str) -> str:
     try:
-        count_int = int(round(float(value)))
+        n = int(round(float(v)))
     except (TypeError, ValueError):
-        return fallback_color
-    if count_int == 1:
-        return "#ff1744"
-    if count_int >= 3:
-        return "#1e88e5"
-    return fallback_color
+        return fallback
+    return "#ff1744" if n == 1 else ("#1e88e5" if n >= 3 else fallback)
 
 
-def _default_brand_window(brands: list[str], focus: str) -> list[str]:
-    if focus not in brands:
-        return brands[:3] if brands else []
-    idx = brands.index(focus)
-    window: list[str] = []
-    if idx > 0:
-        window.append(brands[idx - 1])
-    window.append(focus)
-    if idx < len(brands) - 1:
-        window.append(brands[idx + 1])
-    return window
-
+# ── Sheet loaders ─────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def load_dataframe(upload: BytesIO, *, sheet_name: str) -> pd.DataFrame:
-    name = getattr(upload, "name", "uploaded_file")
-    suffix = Path(name).suffix.lower()
+def load_sheet(upload: BytesIO, *, sheet_name: str) -> pd.DataFrame:
+    suffix = Path(getattr(upload, "name", "f")).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError(
-            f"Unsupported extension '{suffix}'. Please upload one of: {', '.join(sorted(SUPPORTED_EXTENSIONS))}."
-        )
+        raise ValueError(f"Unsupported file type '{suffix}'.")
     upload.seek(0)
-    if suffix == ".xlsb":
-        try:
-            import pyxlsb  # type: ignore  # noqa: F401
-        except ImportError as exc:  # pragma: no cover - runtime feedback inside Streamlit
-            raise ImportError(
-                "Reading .xlsb files requires the optional 'pyxlsb' package. Install it via 'pip install pyxlsb'."
-            ) from exc
-        df = pd.read_excel(upload, sheet_name=sheet_name, engine="pyxlsb")
-    else:
-        df = pd.read_excel(upload, sheet_name=sheet_name)
+    df = pd.read_excel(upload, sheet_name=sheet_name, engine="pyxlsb" if suffix == ".xlsb" else None)
     upload.seek(0)
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
+def load_brands(upload: BytesIO) -> list[str]:
+    try:
+        df = load_sheet(upload, sheet_name=BRANDS_SHEET_NAME)
+    except Exception:
+        return []
+    vals = df.iloc[:, 0].dropna().astype(str).str.strip().tolist()
+    return list(dict.fromkeys(v for v in vals if v))
+
+
+def load_com(upload: BytesIO) -> dict[str, dict[str, list[str]]]:
+    """Returns {sku: {base_brand: [competitor, ...]}}"""
+    try:
+        df = load_sheet(upload, sheet_name=COM_SHEET_NAME)
+    except Exception:
+        return {}
+    # Flexible column name matching
+    rename: dict[str, str] = {}
+    for col in df.columns:
+        n = _norm(col)
+        if "product" in n and COM_PRODUCT_COL not in rename.values():
+            rename[col] = COM_PRODUCT_COL
+        elif "base" in n and "brand" in n and COM_BASE_BRAND_COL not in rename.values():
+            rename[col] = COM_BASE_BRAND_COL
+        elif (n == "com" or n.startswith("com")) and COM_COMPETITOR_COL not in rename.values():
+            rename[col] = COM_COMPETITOR_COL
+    df = df.rename(columns=rename)
+    if not {COM_PRODUCT_COL, COM_BASE_BRAND_COL, COM_COMPETITOR_COL}.issubset(df.columns):
+        return {}
+    df = df[[COM_PRODUCT_COL, COM_BASE_BRAND_COL, COM_COMPETITOR_COL]].dropna(
+        subset=[COM_PRODUCT_COL, COM_BASE_BRAND_COL]
+    )
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.strip()
+    out: dict[str, dict[str, list[str]]] = {}
+    for _, row in df.iterrows():
+        sku, base, comp = row[COM_PRODUCT_COL], row[COM_BASE_BRAND_COL], row[COM_COMPETITOR_COL]
+        out.setdefault(sku, {}).setdefault(base, [])
+        if comp and _norm(comp) not in ("nan", ""):
+            out[sku][base].append(comp)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# APP
+# ═══════════════════════════════════════════════════════════════════════════════
+
 st.title("📊 Price Index Explorer")
-st.caption("Upload market tracker data to benchmark Atyab, Chikitita, and Meatland across time.")
 
+# ── Sidebar: file + column mapping ───────────────────────────────────────────
 with st.sidebar:
-    st.header("1️⃣ Data source")
-    uploaded_file = st.file_uploader("Upload Excel (.xlsb/.xlsx/.xls)", type=["xlsb", "xlsx", "xls"], accept_multiple_files=False)
-    sheet_name = st.text_input("Sheet name", value=DEFAULT_SHEET)
-
+    st.header("1️⃣  Data source")
+    uploaded_file = st.file_uploader("Upload Excel (.xlsb / .xlsx / .xls)", type=["xlsb", "xlsx", "xls"])
+    sheet_input = st.text_input("Market sheet name", value=DEFAULT_SHEET)
     if uploaded_file is None:
         st.info("Upload a file to begin.")
         st.stop()
-
     try:
-        raw_df = load_dataframe(uploaded_file, sheet_name=sheet_name or DEFAULT_SHEET)
-    except Exception as err:
-        st.error(f"Failed to load workbook: {err}")
+        raw_df = load_sheet(uploaded_file, sheet_name=sheet_input or DEFAULT_SHEET)
+    except Exception as e:
+        st.error(f"Failed to load: {e}")
         st.stop()
 
 if raw_df.empty:
-    st.warning("The selected worksheet is empty.")
+    st.warning("Worksheet is empty.")
     st.stop()
 
-raw_df.columns = [str(col).strip() for col in raw_df.columns]
-
-priority_brand_list: list[str] = []
-try:
-    brands_df = load_dataframe(uploaded_file, sheet_name=BRANDS_SHEET_NAME)
-except ValueError:
-    brands_df = pd.DataFrame()
-except Exception as exc:
-    st.warning(f"Unable to read '{BRANDS_SHEET_NAME}' sheet: {exc}")
-    brands_df = pd.DataFrame()
-
-if not brands_df.empty:
-    first_column = brands_df.columns[0]
-    series = brands_df[first_column].dropna().astype(str).str.strip()
-    priority_brand_list = [brand for brand in series.tolist() if brand]
-    # Preserve ordering but remove duplicates
-    priority_brand_list = list(dict.fromkeys(priority_brand_list))
-
-columns = raw_df.columns.tolist()
-brand_price_column_map = _build_brand_metric_map(columns, ["price", "index"])
-brand_price_per_kg_map = _build_brand_metric_map(columns, ["price", "per", "kg", "promoted"])
-generic_price_per_kg_col = _find_generic_price_per_kg_column(columns)
-
-if generic_price_per_kg_col:
-    for focus_brand in FOCUS_BRANDS:
-        brand_price_per_kg_map.setdefault(focus_brand, generic_price_per_kg_col)
+# Load Brands + Com helper sheets
+brands_list = load_brands(uploaded_file)
+com_map = load_com(uploaded_file)
 
 with st.sidebar:
-    st.header("2️⃣ Column mapping")
-    brand_col_guess = _guess_column(columns, ["brand"])
-    item_col_guess = _guess_item_column(columns)
-    customer_col_guess = _guess_column(columns, ["customer"])
-    channel_col_guess = _guess_column(columns, ["channel"])
-    date_col_guess = _guess_column(columns, ["date"])
-    price_candidates = _find_price_columns(raw_df)
-
-    brand_col = st.selectbox("Brand column", options=columns, index=columns.index(brand_col_guess) if brand_col_guess in columns else 0)
-    item_col = st.selectbox("Item description column", options=columns, index=columns.index(item_col_guess) if item_col_guess in columns else 0)
-    channel_col = st.selectbox(
-        "Sales channel column",
-        options=["(none)"] + columns,
-        index=(columns.index(channel_col_guess) + 1) if channel_col_guess in columns else 0,
-        help="Choose the column that stores sales channel names (optional).",
-    )
-    customer_col = st.selectbox(
-        "Customer name column",
-        options=["(none)"] + columns,
-        index=(columns.index(customer_col_guess) + 1) if customer_col_guess in columns else 0,
-        help="Choose the column that stores customer names (optional).",
-    )
-    date_col = st.selectbox(
-        "Date column",
-        options=["(none)"] + columns,
-        index=(columns.index(date_col_guess) + 1) if date_col_guess in columns else 0,
-        help="Choose the column that stores transaction or observation dates.",
-    )
-    selected_price_cols = st.multiselect(
-        "Price index column(s)",
-        options=columns,
-        default=[col for col in price_candidates if col in columns][: max(1, len(price_candidates))],
-        help="Select the numeric column(s) that contain price index values.",
-    )
-
-if not selected_price_cols:
-    st.error("Select at least one price index column to continue.")
-    st.stop()
-
-working_df = raw_df.copy()
-
-if date_col != "(none)":
-    raw_dates = working_df[date_col]
-    dt_series = pd.to_datetime(raw_dates, errors="coerce", infer_datetime_format=True)
-    excel_candidates = raw_dates.apply(_convert_excel_serial)
-    excel_mask = excel_candidates.notna()
-    dt_series = dt_series.mask(excel_mask, excel_candidates)
-    if pd.api.types.is_datetime64tz_dtype(dt_series):
-        dt_series = dt_series.dt.tz_convert(None)
-    dt_series = dt_series.dt.normalize()
-    working_df[date_col] = dt_series
-
-columns_to_normalize: set[str] = set(selected_price_cols)
-columns_to_normalize.update(brand_price_column_map.values())
-for col in columns_to_normalize:
-    if col not in working_df.columns:
-        continue
-    working_df[col] = _normalize_percent_series(
-        working_df[col].replace({"-": np.nan, "": np.nan})
-    )
-
-per_kg_columns_to_numeric = set(brand_price_per_kg_map.values())
-if generic_price_per_kg_col:
-    per_kg_columns_to_numeric.add(generic_price_per_kg_col)
-
-for col in per_kg_columns_to_numeric:
-    if col not in working_df.columns:
-        continue
-    cleaned_series = (
-        working_df[col]
-        .astype(str)
-        .str.strip()
-        .replace({"-": np.nan, "": np.nan})
-    )
-    cleaned_series = cleaned_series.str.replace(r"[^0-9,.-]", "", regex=True)
-    cleaned_series = cleaned_series.str.replace(",", "", regex=False)
-    working_df[col] = pd.to_numeric(cleaned_series, errors="coerce")
-
-required_subset = [brand_col, item_col]
-if customer_col != "(none)":
-    required_subset.append(customer_col)
-working_df = working_df.dropna(subset=required_subset)
-
-available_items = working_df[item_col].astype(str).sort_values().unique().tolist()
-
-if not available_items:
-    st.error("No item descriptions found after cleaning. Adjust the column mapping.")
-    st.stop()
-
-default_item_index = (
-    available_items.index(DEFAULT_ITEM_DESCRIPTION)
-    if DEFAULT_ITEM_DESCRIPTION in available_items
-    else 0
-)
-
-st.markdown("### 🔍 Item selection")
-selected_item = st.selectbox(
-    "Item description",
-    options=available_items,
-    index=default_item_index,
-    key=ITEM_SELECT_KEY,
-    help="Choose a starting item. You can tweak the text below to jump to a similar description without retyping it from scratch.",
-)
-
-if st.session_state.get(ITEM_LAST_SELECTED_KEY) != selected_item:
-    st.session_state[ITEM_INPUT_KEY] = selected_item
-    st.session_state[ITEM_LAST_SELECTED_KEY] = selected_item
-
-editable_item = st.text_input(
-    "Refine item description",
-    key=ITEM_INPUT_KEY,
-    help="Edit the selected description. A close match from the data will be used automatically.",
-).strip()
-
-resolved_item = selected_item
-if editable_item:
-    if editable_item in available_items:
-        resolved_item = editable_item
-    else:
-        partial_matches = [item for item in available_items if editable_item.lower() in item.lower()]
-        if partial_matches:
-            resolved_item = partial_matches[0]
-        else:
-            close_match = get_close_matches(editable_item, available_items, n=1, cutoff=0.0)
-            if close_match:
-                resolved_item = close_match[0]
-            else:
-                st.warning("No item matches the text you entered. Using the original selection.")
-
-if resolved_item != selected_item:
-    st.session_state[ITEM_SELECT_KEY] = resolved_item
-    selected_item = resolved_item
-    st.session_state[ITEM_INPUT_KEY] = resolved_item
-    st.session_state[ITEM_LAST_SELECTED_KEY] = resolved_item
-else:
-    selected_item = resolved_item
-
-item_mask = working_df[item_col].astype(str) == selected_item
-item_subset = working_df.loc[item_mask].copy()
-
-customer_selection: Optional[list[str]] = None
-channel_selection: Optional[list[str]] = None
-
-filters_container = st.sidebar.container()
-
-with filters_container:
-    st.header("3️⃣ Additional filters")
-    st.caption("Refine analysis with customer, brand, and date filters.")
-
-    if channel_col != "(none)" and channel_col in item_subset.columns:
-        item_subset.loc[:, channel_col] = (
-            item_subset[channel_col].astype(str).str.strip().replace({"": np.nan, "nan": np.nan})
-        )
-        channel_options = (
-            item_subset[channel_col].dropna().astype(str).sort_values().unique().tolist()
-        )
-        if channel_options:
-            channel_selection = st.multiselect(
-                "Sales channel",
-                options=channel_options,
-                default=channel_options,
-                help="Filter the view to specific sales channels.",
-            )
-            if not channel_selection:
-                st.warning("Select at least one sales channel to continue.")
-                st.stop()
-            channel_mask = item_subset[channel_col].astype(str).isin(channel_selection)
-            item_subset = item_subset.loc[channel_mask]
-        else:
-            st.info("No sales channels available for the selected item.")
-
-    if customer_col != "(none)":
-        customer_options = (
-            item_subset[customer_col]
-            .dropna()
-            .astype(str)
-            .sort_values()
-            .unique()
-            .tolist()
-        )
-        if customer_options:
-            customer_selection = st.multiselect(
-                "Customer name",
-                options=customer_options,
-                default=customer_options,
-                help="Filter results to specific customers.",
-            )
-            if not customer_selection:
-                st.warning("Select at least one customer to continue.")
-                st.stop()
-            customer_mask = item_subset[customer_col].astype(str).isin(customer_selection)
-            item_subset = item_subset.loc[customer_mask]
-        else:
-            st.info("No customer names available for the selected item.")
-
-    available_brands = (
-        item_subset[brand_col]
-        .astype(str)
-        .sort_values()
-        .unique()
-        .tolist()
-    )
-    if not available_brands:
-        st.warning("No brands found for the selected item and customer filters. Adjust the selections.")
+    if not brands_list:
+        st.error("❌ 'Brands' sheet missing or empty. Please add a sheet named 'Brands' with one brand per row.")
         st.stop()
 
-preferred_brands = priority_brand_list or FOCUS_BRANDS
-base_brand_options = [brand for brand in preferred_brands if brand in available_brands]
+    st.header("2️⃣  Column mapping")
+    all_cols = raw_df.columns.tolist()
 
-if not base_brand_options:
-    base_brand_options = available_brands
+    brand_col = st.selectbox(
+        "Brand column", all_cols,
+        index=all_cols.index(g) if (g := _guess(all_cols, ["brand"])) in all_cols else 0,
+    )
+    item_col = st.selectbox(
+        "Item description column", all_cols,
+        index=all_cols.index(g) if (g := _guess_item_col(all_cols)) in all_cols else 0,
+    )
+    channel_col = st.selectbox(
+        "Sales channel (optional)", ["(none)"] + all_cols,
+        index=(all_cols.index(g) + 1) if (g := _guess(all_cols, ["channel"])) in all_cols else 0,
+    )
+    customer_col = st.selectbox(
+        "Customer column (optional)", ["(none)"] + all_cols,
+        index=(all_cols.index(g) + 1) if (g := _guess(all_cols, ["customer"])) in all_cols else 0,
+    )
+    date_col = st.selectbox(
+        "Date column (optional)", ["(none)"] + all_cols,
+        index=(all_cols.index(g) + 1) if (g := _guess(all_cols, ["date"])) in all_cols else 0,
+    )
+    pi_candidates = _find_price_index_cols(raw_df)
+    selected_pi_cols = st.multiselect(
+        "Price index column(s)", all_cols,
+        default=[c for c in pi_candidates if c in all_cols][: max(1, len(pi_candidates))],
+    )
 
-if not base_brand_options:
-    st.warning("Atyab, Chikitita, and Meatland are not available for the current selections. Adjust filters to include one of them.")
+if not selected_pi_cols:
+    st.error("Select at least one price index column.")
     st.stop()
 
-default_base_brand = base_brand_options[0]
+# ── Pre-process ───────────────────────────────────────────────────────────────
+wdf = raw_df.copy()
 
-st.markdown("### ⚖️ Base brand selection")
-base_brand = st.selectbox(
-    "Base brand for price comparison",
-    options=base_brand_options,
-    index=base_brand_options.index(default_base_brand) if default_base_brand in base_brand_options else 0,
-    help="All brands for the chosen item are shown. The base brand acts as the reference for price index deltas.",
+if date_col != "(none)":
+    raw_d = wdf[date_col]
+    dt = pd.to_datetime(raw_d, errors="coerce", infer_datetime_format=True)
+    serial = raw_d.apply(_excel_serial)
+    dt = dt.mask(serial.notna(), serial)
+    if pd.api.types.is_datetime64tz_dtype(dt):
+        dt = dt.dt.tz_convert(None)
+    wdf[date_col] = dt.dt.normalize()
+
+# Brand→price-index-col and brand→per-kg-col maps (for brands_list brands)
+brand_pi_map = _brand_col_map(all_cols, ["price", "index"], brands_list)
+generic_pkg = _find_generic_per_kg(all_cols)
+brand_pkg_map = _build_pkg = _brand_col_map(all_cols, ["price", "per", "kg", "promoted"], brands_list)
+if generic_pkg:
+    for b in brands_list:
+        brand_pkg_map.setdefault(b, generic_pkg)
+
+# Normalize price-index cols
+pi_to_norm = set(selected_pi_cols) | set(brand_pi_map.values())
+for c in pi_to_norm:
+    if c in wdf.columns:
+        wdf[c] = _norm_pct(wdf[c].replace({"-": np.nan, "": np.nan}))
+
+# Numeric per-kg cols
+pkg_to_clean = set(brand_pkg_map.values())
+if generic_pkg:
+    pkg_to_clean.add(generic_pkg)
+for c in pkg_to_clean:
+    if c not in wdf.columns:
+        continue
+    s = wdf[c].astype(str).str.strip().replace({"-": np.nan, "": np.nan})
+    s = s.str.replace(r"[^0-9,.-]", "", regex=True).str.replace(",", "", regex=False)
+    wdf[c] = pd.to_numeric(s, errors="coerce")
+
+wdf = wdf.dropna(subset=[brand_col, item_col])
+
+# ── Data validation report ───────────────────────────────────────────────────
+all_items = wdf[item_col].astype(str).sort_values().unique().tolist()
+all_market_brands = set(wdf[brand_col].astype(str).unique())
+
+if com_map:
+    # Collect all issues
+    issues_unmatched_sku: list[dict] = []      # Com product not in Market SKUs
+    issues_base_brand: list[dict] = []          # Com base brand not in Brands sheet
+    issues_com_brand: list[dict] = []           # Com competitor not in Market brands
+
+    for sku, base_dict in com_map.items():
+        # 1. Check SKU match in Market
+        exact_sku_match = sku in all_items
+        if not exact_sku_match:
+            # Prefix match: same text before the first "_"
+            prefix = sku.split("_")[0].strip()
+            prefix_matches = [i for i in all_items if i.split("_")[0].strip() == prefix]
+            # Only exact or prefix counts as resolved — no fuzzy guessing
+            # If neither resolves, it is a true no-match → report it
+            if not prefix_matches:
+                issues_unmatched_sku.append({
+                    "Com Product": sku,
+                })
+
+        for base_b, competitors in base_dict.items():
+            # 2. Base brand vs Brands sheet
+            if base_b not in brands_list:
+                fuzzy_brand = get_close_matches(base_b, brands_list, n=1, cutoff=0.6)
+                issues_base_brand.append({
+                    "Com Base Brand": base_b,
+                    "Com Product": sku,
+                    "Did you mean?": fuzzy_brand[0] if fuzzy_brand else "—",
+                })
+
+            # 3. Competitor brands vs Market brands
+            for comp in competitors:
+                if comp not in all_market_brands:
+                    fuzzy_comp = get_close_matches(comp, list(all_market_brands), n=1, cutoff=0.6)
+                    issues_com_brand.append({
+                        "Com Competitor": comp,
+                        "Com Product": sku,
+                        "Base Brand": base_b,
+                        "Did you mean?": fuzzy_comp[0] if fuzzy_comp else "—",
+                    })
+
+    total_issues = len(issues_unmatched_sku) + len(issues_base_brand) + len(issues_com_brand)
+
+    with st.expander(
+        f"{'⚠️' if total_issues else '✅'} Data validation report "
+        f"({'%d issue%s found' % (total_issues, 's' if total_issues != 1 else '')} — click to review)"
+        if com_map else "✅ Data validation report",
+        expanded=total_issues > 0,
+    ):
+        if total_issues == 0:
+            st.success("✅ All Com sheet products, base brands, and competitors match the Market data perfectly.")
+        else:
+            st.caption(
+                "These mismatches may cause missing data in charts or the snapshot. "
+                "Fix them in the Excel file or the Com sheet to ensure accuracy."
+            )
+
+        if issues_unmatched_sku:
+            st.markdown(f"#### 🔴 Com products not found in Market SKUs ({len(issues_unmatched_sku)})")
+            st.caption(
+                "These product names in the 'Com' sheet do not exactly match any Item Description "
+                "in the Market sheet. The dashboard will try a prefix fallback but exact names are recommended."
+            )
+            st.dataframe(
+                pd.DataFrame(issues_unmatched_sku)[["Com Product"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Com Product": st.column_config.TextColumn("Com Sheet Product — not found in Market"),
+                },
+            )
+
+        if issues_base_brand:
+            st.markdown(f"#### 🟠 Com base brands not in Brands sheet ({len(issues_base_brand)})")
+            st.caption(
+                "These base brands appear in the 'Com' sheet but are not listed in the 'Brands' sheet. "
+                "They will not appear as selectable base brands in the dashboard."
+            )
+            st.dataframe(
+                pd.DataFrame(issues_base_brand),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Com Base Brand": st.column_config.TextColumn("Base Brand in Com"),
+                    "Com Product": st.column_config.TextColumn("Product"),
+                    "Did you mean?": st.column_config.TextColumn("Closest in Brands sheet"),
+                },
+            )
+
+        if issues_com_brand:
+            st.markdown(f"#### 🟡 Competitor brands not found in Market data ({len(issues_com_brand)})")
+            st.caption(
+                "These competitor brands are listed in the 'Com' sheet but have no records "
+                "in the Market sheet. Their prices will show as '—' in the snapshot."
+            )
+            st.dataframe(
+                pd.DataFrame(issues_com_brand),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Com Competitor": st.column_config.TextColumn("Competitor in Com"),
+                    "Com Product": st.column_config.TextColumn("Product"),
+                    "Base Brand": st.column_config.TextColumn("Base Brand"),
+                    "Did you mean?": st.column_config.TextColumn("Closest in Market"),
+                },
+            )
+
+st.markdown("---")
+
+# ── STEP 1: Item selection ────────────────────────────────────────────────────
+if not all_items:
+    st.error("No items found in data.")
+    st.stop()
+
+def_idx = all_items.index(DEFAULT_ITEM) if DEFAULT_ITEM in all_items else 0
+
+st.markdown("### 🔍 Step 1 — Select item")
+selected_item = st.selectbox("Item description", all_items, index=def_idx, key=ITEM_SELECT_KEY)
+
+# Optional text refinement — no key, no session_state writes after widget creation
+refined = st.text_input(
+    "Refine item description (optional)",
+    value=selected_item,
+    help="Edit to narrow down. A close match will be used automatically.",
+).strip()
+if refined and refined != selected_item:
+    if refined in all_items:
+        selected_item = refined
+    else:
+        hits = [i for i in all_items if refined.lower() in i.lower()]
+        selected_item = (
+            hits[0] if hits
+            else (get_close_matches(refined, all_items, n=1, cutoff=0.0) or [selected_item])[0]
+        )
+
+# ── STEP 2: Auto-resolve base brand + competitors ─────────────────────────────
+#
+#  Rule:
+#    - base_brand comes from the "Base Brand" column of the Com sheet for this SKU
+#      AND must be one of the brands in the Brands sheet.
+#    - brand_selection = [base_brand] + Com competitors, filtered to brands with data.
+#
+st.markdown("### ⚖️ Step 2 — Base brand & competitors")
+
+brands_with_data: set[str] = set(
+    wdf.loc[wdf[item_col].astype(str) == selected_item, brand_col].astype(str).unique()
 )
 
-base_price_col = brand_price_column_map.get(base_brand)
-if base_price_col is None:
-    st.warning(
-        "Could not find a price index column for the selected base brand. Ensure the sheet includes a column whose name contains the brand."
-    )
-    st.stop()
+# Resolve Com sheet entry: try exact SKU first, then prefix before first "_"
+sku_com: dict[str, list[str]] = com_map.get(selected_item, {})
+com_match_key = selected_item  # track which key actually matched
 
-base_price_per_kg_col = brand_price_per_kg_map.get(base_brand)
-if base_price_per_kg_col is None and generic_price_per_kg_col:
-    base_price_per_kg_col = generic_price_per_kg_col
+if not sku_com:
+    prefix = selected_item.split("_")[0].strip()
+    # Find any Com sheet product that starts with the same prefix
+    for com_key in com_map:
+        if com_key.split("_")[0].strip() == prefix:
+            sku_com = com_map[com_key]
+            com_match_key = com_key
+            break
 
-selected_price_cols = [base_price_col]
-caption_parts = [f"Using price index column: {base_price_col}"]
-if base_price_per_kg_col:
-    caption_parts.append(f"Price per KG promoted column: {base_price_per_kg_col}")
-st.caption(" | ".join(caption_parts))
+# Base brand candidates: must be in both Brands sheet and Com sheet for this SKU
+valid_base = [b for b in brands_list if b in sku_com and b in brands_with_data]
 
-with filters_container:
-    default_brand_selection = _default_brand_window(available_brands, base_brand)
-    brand_selection = st.multiselect(
-        "Brands to display",
-        options=available_brands,
-        default=available_brands,
-        help="All brands are selected by default. Adjust to focus analysis if needed.",
-    )
-    if base_brand not in brand_selection:
-        brand_selection.append(base_brand)
-    ordered_unique: list[str] = []
-    for brand in available_brands:
-        if brand in brand_selection and brand not in ordered_unique:
-            ordered_unique.append(brand)
-    brand_selection = ordered_unique or [base_brand]
-    initial_visible_brands: set[str] = set(default_brand_selection or [base_brand])
-    initial_visible_brands.add(base_brand)
-
-    if date_col != "(none)" and working_df[date_col].notna().any():
-        date_series = (
-            working_df.loc[working_df[item_col].astype(str) == selected_item, date_col]
-            .dropna()
-            .sort_values()
+if not valid_base:
+    # Graceful fallback: Brands-sheet brands that at least have data
+    valid_base = [b for b in brands_list if b in brands_with_data]
+    if not valid_base:
+        st.error(
+            f"No brand from the 'Brands' sheet has data for **'{selected_item}'**. "
+            "Select a different item or check the data."
         )
-        if not date_series.empty:
-            date_options = sorted({ts.date() for ts in date_series})
-            if len(date_options) == 1:
-                only_date = date_options[0]
-                st.caption(f"Only one date available: {only_date:%Y-%m-%d}")
-                start_date = end_date = only_date
-                selected_date = only_date
-            else:
-                start_date, end_date = st.select_slider(
-                    "Date range",
-                    options=date_options,
-                    value=(
-                        next(
-                            (
-                                dt
-                                for dt in date_options
-                                if dt >= (date_options[-1] - timedelta(days=30))
-                            ),
-                            date_options[0],
-                        ),
-                        date_options[-1],
-                    ),
-                    format_func=lambda dt: dt.strftime("%Y-%m-%d"),
-                )
-                enable_single_date = st.checkbox(
-                    "Filter to a single date",
-                    value=False,
-                    help="Enable to focus charts and records on one date within the selected range.",
-                )
-                selected_date = None
-                if enable_single_date:
-                    default_focus = min(max(end_date, start_date), end_date)
-                    selected_date = st.date_input(
-                        "Select date",
-                        value=default_focus,
-                        min_value=start_date,
-                        max_value=end_date,
-                        format="YYYY-MM-DD",
-                    )
-        else:
-            start_date = end_date = selected_date = None
+        st.stop()
+    if sku_com:
+        st.warning(
+            f"⚠️ Com sheet has entries for this product "
+            f"({', '.join(sku_com.keys())}), but none are in the 'Brands' sheet."
+        )
     else:
-        start_date = end_date = selected_date = None
+        st.warning(
+            f"⚠️ No competition mapping found for **'{selected_item}'** "
+            f"(also tried prefix '{selected_item.split('_')[0].strip()}')."
+        )
 
+# Show selectbox only if multiple base brands are possible
+if len(valid_base) == 1:
+    base_brand = valid_base[0]
+    st.info(f"🏷️ Base brand: **{base_brand}**")
+else:
+    base_brand = st.selectbox(
+        "Base brand (from 'Brands' sheet)",
+        options=valid_base,
+        help="Multiple base brands found for this product in the 'Brands' sheet.",
+    )
 
-if not brand_selection:
-    st.warning("Select at least one brand.")
-    st.stop()
+# Competitors from Com sheet for (SKU, base_brand), filtered to what's in data
+com_competitors: list[str] = sku_com.get(base_brand, [])
+valid_competitors = [b for b in com_competitors if b in brands_with_data]
 
-filtered = working_df[working_df[item_col].astype(str) == selected_item]
-filtered = filtered[filtered[brand_col].astype(str).isin(brand_selection)]
+# Final brand list — EXACTLY these brands, nothing else
+brand_selection: list[str] = list(dict.fromkeys([base_brand] + valid_competitors))
+initial_visible: set[str] = set(brand_selection)
 
-if customer_col != "(none)" and customer_selection:
-    filtered = filtered[filtered[customer_col].astype(str).isin(customer_selection)]
+# Feedback
+if valid_competitors:
+    st.success(
+        f"✅ **{base_brand}** vs **{', '.join(valid_competitors)}** "
+        "(mapped in 'Com' sheet)"
+    )
+elif com_competitors:
+    st.warning(
+        f"⚠️ Com sheet maps {', '.join(com_competitors)} as competitors "
+        f"of '{base_brand}', but they have no data here."
+    )
+else:
+    st.warning(f"⚠️ No competitors mapped for '{base_brand}' on this product in the 'Com' sheet.")
 
+# ── STEP 3: Optional filters (channel, customer, date) ───────────────────────
+st.markdown("### 🔎 Step 3 — Filters")
+
+# Subset: selected item + mapped brands only
+subset_mask = (
+    (wdf[item_col].astype(str) == selected_item)
+    & (wdf[brand_col].astype(str).isin(brand_selection))
+)
+item_sub = wdf.loc[subset_mask].copy()
+
+customer_sel: Optional[list[str]] = None
+channel_sel: Optional[list[str]] = None
+c1, c2 = st.columns(2)
+
+with c1:
+    if channel_col != "(none)" and channel_col in item_sub.columns:
+        item_sub[channel_col] = (
+            item_sub[channel_col].astype(str).str.strip().replace({"": np.nan, "nan": np.nan})
+        )
+        ch_opts = item_sub[channel_col].dropna().sort_values().unique().tolist()
+        if ch_opts:
+            channel_sel = st.multiselect("Sales channel", ch_opts, default=ch_opts)
+            if not channel_sel:
+                st.warning("Select at least one channel.")
+                st.stop()
+            item_sub = item_sub[item_sub[channel_col].astype(str).isin(channel_sel)]
+
+with c2:
+    if customer_col != "(none)" and customer_col in item_sub.columns:
+        cu_opts = item_sub[customer_col].dropna().astype(str).sort_values().unique().tolist()
+        if cu_opts:
+            customer_sel = st.multiselect("Customer", cu_opts, default=cu_opts)
+            if not customer_sel:
+                st.warning("Select at least one customer.")
+                st.stop()
+            item_sub = item_sub[item_sub[customer_col].astype(str).isin(customer_sel)]
+
+start_date = end_date = selected_date = None
+with st.sidebar:
+    st.header("3️⃣  Date filter")
+    # Use full wdf (all items, all brands) for date options so the filter
+    # applies globally across charts AND the brand snapshot
+    _date_source = wdf if date_col != "(none)" and date_col in wdf.columns else None
+    if _date_source is not None and _date_source[date_col].notna().any():
+        date_opts = sorted({ts.date() for ts in _date_source[date_col].dropna()})
+        if len(date_opts) == 1:
+            start_date = end_date = date_opts[0]
+            st.caption(f"Only one date available: {date_opts[0]:%Y-%m-%d}")
+        else:
+            start_date, end_date = st.select_slider(
+                "Date range", options=date_opts,
+                value=(
+                    next((d for d in date_opts if d >= date_opts[-1] - timedelta(days=30)), date_opts[0]),
+                    date_opts[-1],
+                ),
+                format_func=lambda d: d.strftime("%Y-%m-%d"),
+            )
+            selected_date = None
+            if st.checkbox("Single date"):
+                selected_date = st.date_input(
+                    "Date", value=end_date, min_value=start_date, max_value=end_date, format="YYYY-MM-DD"
+                )
+    else:
+        st.caption("No date column selected.")
+
+# Apply date filter to item_sub so channel/customer options respect the date range
+if date_col != "(none)" and date_col in item_sub.columns:
+    if start_date and end_date:
+        item_sub = item_sub[item_sub[date_col].dt.date.between(start_date, end_date)]
+    if selected_date is not None:
+        item_sub = item_sub[item_sub[date_col].dt.date == selected_date]
+
+# ── Build filtered dataset ────────────────────────────────────────────────────
+filtered = wdf[
+    (wdf[item_col].astype(str) == selected_item)
+    & (wdf[brand_col].astype(str).isin(brand_selection))
+].copy()
+
+if channel_col != "(none)" and channel_sel:
+    filtered = filtered[filtered[channel_col].astype(str).isin(channel_sel)]
+if customer_col != "(none)" and customer_sel:
+    filtered = filtered[filtered[customer_col].astype(str).isin(customer_sel)]
 if date_col != "(none)" and start_date and end_date:
-    mask = filtered[date_col].dt.date.between(start_date, end_date)
-    filtered = filtered[mask]
-
+    filtered = filtered[filtered[date_col].dt.date.between(start_date, end_date)]
 if date_col != "(none)" and selected_date is not None:
     filtered = filtered[filtered[date_col].dt.date == selected_date]
+
+has_dates = (
+    date_col != "(none)"
+    and date_col in filtered.columns
+    and filtered[date_col].notna().any()
+)
+if has_dates:
+    filtered = filtered.sort_values([date_col, brand_col])
 
 if filtered.empty:
     st.warning("No records match the current filters.")
     st.stop()
 
-brand_per_kg_columns: dict[str, str] = {}
-for brand in brand_selection:
-    per_kg_col = brand_price_per_kg_map.get(brand)
-    if per_kg_col is None and generic_price_per_kg_col:
-        per_kg_col = generic_price_per_kg_col
-    if per_kg_col and per_kg_col in filtered.columns:
-        brand_per_kg_columns[brand] = per_kg_col
+# ── Resolve price-index col and per-kg cols for active brands ─────────────────
+base_pi_col = brand_pi_map.get(base_brand)
+if base_pi_col is None:
+    for c in selected_pi_cols:
+        if _norm(base_brand) in _norm(c):
+            base_pi_col = c
+            break
+if base_pi_col is None:
+    base_pi_col = selected_pi_cols[0]
+active_pi = [base_pi_col]
 
-brand_latest_per_kg: dict[str, float] = {}
-brand_per_kg_by_date: dict[str, dict[str, float]] = {}
-brand_str_series = filtered[brand_col].astype(str)
-has_valid_dates = (
-    date_col != "(none)"
-    and date_col in filtered.columns
-    and filtered[date_col].notna().any()
-)
+brand_pkg_cols: dict[str, str] = {}
+for b in brand_selection:
+    c = brand_pkg_map.get(b) or generic_pkg
+    if c and c in filtered.columns:
+        brand_pkg_cols[b] = c
 
-for brand, per_kg_col in brand_per_kg_columns.items():
-    brand_mask = brand_str_series == brand
-    brand_subset = filtered.loc[brand_mask].copy()
-    if brand_subset.empty:
+# Per-kg latest + by-date
+latest_pkg: dict[str, float] = {}
+pkg_by_date: dict[str, dict[str, float]] = {}
+for b, pkg_col in brand_pkg_cols.items():
+    bdf = filtered.loc[filtered[brand_col].astype(str) == b]
+    s = bdf[pkg_col].dropna()
+    if s.empty:
         continue
-    per_series = brand_subset[per_kg_col].dropna()
-    if per_series.empty:
-        continue
-    if has_valid_dates:
-        dated_subset = brand_subset.dropna(subset=[date_col, per_kg_col])
-        if not dated_subset.empty:
-            dated_subset = dated_subset.sort_values(by=date_col)
-            brand_latest_per_kg[brand] = float(dated_subset.iloc[-1][per_kg_col])
-            grouped = dated_subset.groupby(dated_subset[date_col])[per_kg_col].mean()
-            brand_per_kg_by_date[brand] = {
-                pd.to_datetime(idx).strftime("%Y-%m-%d"): float(val)
-                for idx, val in grouped.items()
+    if has_dates:
+        d2 = bdf.dropna(subset=[date_col, pkg_col]).sort_values(date_col)
+        if not d2.empty:
+            latest_pkg[b] = float(d2.iloc[-1][pkg_col])
+            pkg_by_date[b] = {
+                pd.to_datetime(k).strftime("%Y-%m-%d"): float(v)
+                for k, v in d2.groupby(date_col)[pkg_col].mean().items()
             }
             continue
-    brand_latest_per_kg[brand] = float(per_series.iloc[-1])
+    latest_pkg[b] = float(s.iloc[-1])
 
 
-def _lookup_per_kg_value(brand: str, x_value: Any) -> float | None:
-    per_kg_map = brand_per_kg_by_date.get(brand)
-    if per_kg_map:
+def _get_pkg(brand: str, x: Any) -> Optional[float]:
+    bd = pkg_by_date.get(brand)
+    if bd:
         try:
-            dt_value = pd.to_datetime(x_value)
-        except Exception:  # pragma: no cover - defensive against unexpected axis data types
-            dt_value = None
-        if dt_value is not None and not pd.isna(dt_value):
-            key = pd.to_datetime(dt_value).strftime("%Y-%m-%d")
-            mapped = per_kg_map.get(key)
-            if mapped is not None:
-                return mapped
-    return brand_latest_per_kg.get(brand)
+            k = pd.to_datetime(x).strftime("%Y-%m-%d")
+            if k in bd:
+                return bd[k]
+        except Exception:
+            pass
+    return latest_pkg.get(brand)
 
 
-base_brand_data = filtered[filtered[brand_col].astype(str) == base_brand]
-if date_col != "(none)" and date_col in filtered.columns and filtered[date_col].notna().any():
-    base_brand_data = base_brand_data.sort_values(by=date_col)
+# ── Colour palette ────────────────────────────────────────────────────────────
+BASE_CLR = "#1b5e20"
+MUTED = "#b0bec5"
+_cyc = cycle(px.colors.qualitative.Safe + px.colors.qualitative.Pastel)
+brand_clr: dict[str, str] = {
+    b: (BASE_CLR if b == base_brand else next(_cyc)) for b in brand_selection
+}
 
-st.subheader(f"Item: {selected_item}")
 
-controls_col, _ = st.columns([1, 6])
-with controls_col:
-    if SHOW_PRICE_LABELS_KEY not in st.session_state:
-        st.session_state[SHOW_PRICE_LABELS_KEY] = True
-    st.checkbox(
-        "Show price values in chart labels",
-        key=SHOW_PRICE_LABELS_KEY,
-        help="Toggle per-kg price information inside chart annotations.",
+def _hl_base(col: pd.Series) -> list[str]:
+    return (
+        ["background-color: #fff59d; font-weight: 600"] * len(col)
+        if col.name == base_brand else [""] * len(col)
     )
-    show_price_labels = st.session_state[SHOW_PRICE_LABELS_KEY]
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# RESULTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("---")
+st.subheader(f"📈 {selected_item}")
 st.caption(
-    "Adjust selections in the sidebar to refine the analysis. Values are aggregated by brand and date where applicable."
+    f"Base: **{base_brand}** | "
+    f"Competitors: {', '.join(valid_competitors) or '—'} | "
+    f"Brands in view: {', '.join(brand_selection)}"
 )
+show_labels = st.checkbox("Show price-per-kg in chart labels", key=SHOW_LABELS_KEY, value=True)
 
-if date_col != "(none)" and filtered[date_col].notna().any():
-    filtered = filtered.sort_values(by=[date_col, brand_col])
-
-snapshot_df = working_df.copy()
-if channel_col != "(none)" and channel_selection:
-    snapshot_df = snapshot_df[snapshot_df[channel_col].astype(str).isin(channel_selection)]
-if customer_col != "(none)" and customer_selection:
-    snapshot_df = snapshot_df[snapshot_df[customer_col].astype(str).isin(customer_selection)]
-if brand_selection:
-    snapshot_df = snapshot_df[snapshot_df[brand_col].astype(str).isin(brand_selection)]
-if date_col != "(none)" and start_date and end_date:
-    snapshot_df = snapshot_df[snapshot_df[date_col].dt.date.between(start_date, end_date)]
-if date_col != "(none)" and selected_date is not None:
-    snapshot_df = snapshot_df[snapshot_df[date_col].dt.date == selected_date]
-
-items_index = (
-    snapshot_df[item_col]
-    .dropna()
-    .astype(str)
-    .sort_values()
-    .unique()
-    .tolist()
-)
-
-pivot_summary = pd.DataFrame(index=items_index)
-for brand_name in brand_selection:
-    price_col = brand_price_per_kg_map.get(brand_name)
-    if price_col is None and generic_price_per_kg_col:
-        price_col = generic_price_per_kg_col
-    if price_col is None or price_col not in working_df.columns:
-        continue
-    brand_mask = snapshot_df[brand_col].astype(str) == brand_name
-    brand_subset = snapshot_df.loc[brand_mask, [item_col, price_col]].copy()
-    if brand_subset.empty:
-        continue
-    brand_subset[item_col] = brand_subset[item_col].astype(str)
-    avg_by_item = brand_subset.groupby(item_col)[price_col].mean()
-    pivot_summary[brand_name] = avg_by_item
-
-pivot_summary.index.name = "Item description"
-pivot_summary = pivot_summary.dropna(how="all")
-present_columns = [brand for brand in brand_selection if brand in pivot_summary.columns]
-other_columns = [col for col in pivot_summary.columns if col not in present_columns]
-pivot_summary = pivot_summary.loc[:, present_columns + other_columns]
-
-formatters = {col: _format_price_per_kg_label for col in pivot_summary.columns}
-
-if not pivot_summary.empty:
-    if base_brand in pivot_summary.columns:
-        pivot_summary = pivot_summary.sort_values(by=base_brand, ascending=False)
-
-styled_summary = pivot_summary.style.format(formatters).apply(_highlight_base_column, axis=0)
-
-highlight_color = "#0d47a1"
-muted_color = "#b0bec5"
-base_bar_color = "#1b5e20"
-
-palette = px.colors.qualitative.Safe + px.colors.qualitative.Pastel
-color_cycle = cycle(palette)
-brand_color_map: dict[str, str] = {}
-for brand in brand_selection:
-    if brand == base_brand:
-        brand_color_map[brand] = base_bar_color
-    else:
-        brand_color_map[brand] = next(color_cycle)
-
-highlight_color = brand_color_map.get(base_brand, base_bar_color)
-
-relative_traces: dict[str, pd.DataFrame] = {}
-if date_col != "(none)" and filtered[date_col].notna().any() and base_brand in filtered[brand_col].unique():
-    for price_col in selected_price_cols:
+# ── Relative price-index traces ───────────────────────────────────────────────
+rel_traces: dict[str, pd.DataFrame] = {}
+if has_dates and base_brand in filtered[brand_col].unique():
+    for pi_col in active_pi:
         pivot = (
-            filtered[[date_col, brand_col, price_col]]
-            .dropna(subset=[price_col])
-            .pivot_table(index=date_col, columns=brand_col, values=price_col, aggfunc="mean")
+            filtered[[date_col, brand_col, pi_col]]
+            .dropna(subset=[pi_col])
+            .pivot_table(index=date_col, columns=brand_col, values=pi_col, aggfunc="mean")
         )
         if pivot.empty or base_brand not in pivot.columns:
             continue
-        base_series = pivot[base_brand]
-        valid_index = base_series.replace(0, np.nan).dropna().index
-        if len(valid_index) == 0:
+        bs = pivot[base_brand]
+        valid_idx = bs.replace(0, np.nan).dropna().index
+        if valid_idx.empty:
             continue
-        pivot = pivot.loc[valid_index]
-        base_series = base_series.loc[valid_index]
-        relative = pivot.divide(base_series, axis=0) - 1
-        first_base_value = base_series.iloc[0] if not base_series.empty else np.nan
-        if pd.notna(first_base_value) and not np.isclose(first_base_value, 0.0):
-            base_trend = (base_series / first_base_value) - 1
-        else:
-            base_trend = base_series.pct_change().fillna(0)
-        relative[base_brand] = base_trend
-        relative = relative.replace([np.inf, -np.inf], np.nan).reset_index()
-        relative = relative.melt(id_vars=[date_col], var_name=brand_col, value_name="relative_value")
-        relative = relative.dropna(subset=["relative_value"])
-        relative["relative_value"] = relative["relative_value"].where(~np.isclose(relative["relative_value"], 0.0, atol=1e-9), 0.0)
-        relative_traces[price_col] = relative
-
-if date_col != "(none)" and filtered[date_col].notna().any():
-    for price_col in selected_price_cols:
-        plot_df = relative_traces.get(price_col)
-        if plot_df is not None and not plot_df.empty:
-            fig = px.line(
-                plot_df,
-                x=date_col,
-                y="relative_value",
-                color=brand_col,
-                markers=True,
-                title=f"{price_col} Δ vs {base_brand}",
-                labels={date_col: "Date", "relative_value": "Δ vs base"},
-                color_discrete_map=brand_color_map,
-            )
-            fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111111"))
-        else:
-            fig = px.line(
-                filtered,
-                x=date_col,
-                y=price_col,
-                color=brand_col,
-                markers=True,
-                title=f"{price_col} trend",
-                labels={date_col: "Date", price_col: price_col, brand_col: "Brand"},
-                color_discrete_map=brand_color_map,
-            )
-            fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111111"))
-        fig.update_traces(
-            texttemplate="%{text}",
-            textposition="middle center",
-            textfont=dict(size=11, color="#111111"),
-            mode="lines+markers+text",
+        pivot, bs = pivot.loc[valid_idx], bs.loc[valid_idx]
+        rel = pivot.divide(bs, axis=0) - 1
+        fv = bs.iloc[0]
+        rel[base_brand] = (bs / fv - 1) if (pd.notna(fv) and not np.isclose(fv, 0.0)) else bs.pct_change().fillna(0)
+        rel = (
+            rel.replace([np.inf, -np.inf], np.nan).reset_index()
+            .melt(id_vars=[date_col], var_name=brand_col, value_name="rel")
+            .dropna(subset=["rel"])
         )
-        fig.update_layout(hovermode="x unified", font=dict(color="#111111"))
-        fig.update_xaxes(tickfont=dict(color="#111111"))
-        for trace_index, trace in enumerate(fig.data):
-            y_values = trace.y if trace.y is not None else []
-            x_values = trace.x if trace.x is not None else []
-            formatted_text: list[str] = []
-            text_positions: list[str] = []
-            seen_points: set[tuple[Any, Any]] = set()
-            for idx, y in enumerate(y_values):
-                label_prefix = f"{trace.name}: " if idx == 0 else ""
-                x_val = x_values[idx] if idx < len(x_values) else idx
-                point_key = (trace.name, x_val)
-                if point_key in seen_points:
-                    formatted_text.append("")
-                    text_positions.append("top center" if (idx % 2 == 0) else "bottom center")
-                    continue
-                seen_points.add(point_key)
+        rel["rel"] = rel["rel"].where(~np.isclose(rel["rel"], 0.0, atol=1e-9), 0.0)
+        rel_traces[pi_col] = rel
+
+# ── Line chart: price index delta ─────────────────────────────────────────────
+if has_dates:
+    for pi_col in active_pi:
+        plot = rel_traces.get(pi_col)
+        if plot is not None and not plot.empty:
+            fig = px.line(
+                plot, x=date_col, y="rel", color=brand_col, markers=True,
+                title=f"{pi_col} — Δ vs {base_brand}",
+                labels={date_col: "Date", "rel": "Δ vs base"},
+                color_discrete_map=brand_clr,
+            )
+            fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111"))
+        else:
+            fig = px.line(
+                filtered, x=date_col, y=pi_col, color=brand_col, markers=True,
+                title=f"{pi_col} trend",
+                labels={date_col: "Date", pi_col: pi_col},
+                color_discrete_map=brand_clr,
+            )
+            fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111"))
+
+        fig.update_layout(hovermode="x unified", font=dict(color="#111"))
+        fig.update_xaxes(tickfont=dict(color="#111"))
+
+        for trace in fig.data:
+            xs = list(trace.x) if trace.x is not None else []
+            ys = list(trace.y) if trace.y is not None else []
+            texts, positions, seen = [], [], set()
+            for i, y in enumerate(ys):
+                xv = xs[i] if i < len(xs) else i
+                key = (trace.name, xv)
+                if key in seen:
+                    texts.append(""); positions.append("top center"); continue
+                seen.add(key)
+                prefix = f"{trace.name}: " if i == 0 else ""
                 if pd.isna(y):
-                    formatted_text.append(f"{trace.name}" if idx == 0 else "")
-                    text_positions.append("top center" if (idx % 2 == 0) else "bottom center")
+                    texts.append(prefix or "")
                 else:
-                    try:
-                        value_text = f"{float(y):.1%}"
-                    except (TypeError, ValueError):
-                        value_text = str(y)
-                    per_kg_value = None
-                    if idx < len(x_values):
-                        per_kg_value = _lookup_per_kg_value(trace.name, x_values[idx])
-                    if show_price_labels and per_kg_value is not None and not pd.isna(per_kg_value):
-                        per_kg_label = _format_price_per_kg_label(per_kg_value)
-                        value_text = f"{value_text} ({per_kg_label})"
-                    formatted_text.append(f"{label_prefix}{value_text}")
-                    text_positions.append("top center" if (idx % 2 == 0) else "bottom center")
-            if formatted_text:
-                trace.text = formatted_text
-            else:
-                x_values = trace.x if trace.x is not None else []
-                trace.text = [str(trace.name)] + [""] * (len(x_values) - 1)
-                text_positions = ["top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(trace.text))]
-            color = brand_color_map.get(trace.name, muted_color)
+                    vs = f"{float(y):.1%}"
+                    if show_labels:
+                        pkg = _get_pkg(trace.name, xv)
+                        if pkg is not None:
+                            vs = f"{vs} ({_fmt_kg(pkg)})"
+                    texts.append(f"{prefix}{vs}")
+                positions.append("top center" if i % 2 == 0 else "bottom center")
+            color = brand_clr.get(trace.name, MUTED)
+            trace.text = texts
+            trace.textposition = positions
+            trace.mode = "lines+markers+text"
+            trace.textfont = dict(size=11, color=color)
             if trace.name == base_brand:
-                trace.update(line=dict(width=2, color=color), marker=dict(size=10, color=color))
+                trace.line = dict(width=2, color=color)
+                trace.marker = dict(size=10, color=color)
             else:
-                trace.update(line=dict(width=1, color=color), marker=dict(size=6, color=color), opacity=0.75)
-            if trace.name not in initial_visible_brands:
+                trace.line = dict(width=1, color=color)
+                trace.marker = dict(size=6, color=color)
+                trace.opacity = 0.85
+            if trace.name not in initial_visible:
                 trace.visible = "legendonly"
-            if len(text_positions) < len(trace.text):
-                text_positions.extend([
-                    "top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(text_positions), len(trace.text))
-                ])
-            trace.update(textposition=text_positions, textfont=dict(size=11, color=color))
+
         st.plotly_chart(fig, use_container_width=True)
 
-    per_kg_trend_rows: list[pd.DataFrame] = []
-    if brand_per_kg_columns and date_col != "(none)" and filtered[date_col].notna().any():
-        for brand in brand_selection:
-            per_kg_col = brand_per_kg_columns.get(brand)
-            if per_kg_col is None:
-                continue
-            brand_slice = filtered.loc[
-                filtered[brand_col].astype(str) == brand, [date_col, per_kg_col]
-            ].dropna()
-            if brand_slice.empty:
-                continue
-            daily_avg = (
-                brand_slice.groupby(date_col, as_index=False)[per_kg_col]
-                .mean()
-                .rename(columns={per_kg_col: "price_per_kg"})
-            )
-            daily_avg[brand_col] = brand
-            per_kg_trend_rows.append(daily_avg)
+    # ── Line chart: price per KG ───────────────────────────────────────────────
+    pkg_rows: list[pd.DataFrame] = []
+    for b in brand_selection:
+        pkg_col = brand_pkg_cols.get(b)
+        if not pkg_col:
+            continue
+        bdf = filtered.loc[filtered[brand_col].astype(str) == b, [date_col, pkg_col]].dropna()
+        if bdf.empty:
+            continue
+        avg = bdf.groupby(date_col, as_index=False)[pkg_col].mean().rename(columns={pkg_col: "pkg"})
+        avg[brand_col] = b
+        pkg_rows.append(avg)
 
-    customer_count_pivot = None
-    if per_kg_trend_rows:
-        per_kg_trend_df = pd.concat(per_kg_trend_rows, ignore_index=True)
-        per_kg_trend_df = per_kg_trend_df.sort_values(date_col)
-        per_kg_pivot = (
-            per_kg_trend_df.pivot_table(
-                index=date_col,
-                columns=brand_col,
-                values="price_per_kg",
-                aggfunc="mean",
-            )
-            .sort_index()
-            .replace([np.inf, -np.inf], np.nan)
-            .dropna(how="all")
+    if pkg_rows:
+        pkg_df = pd.concat(pkg_rows, ignore_index=True).sort_values(date_col)
+        pkg_piv = (
+            pkg_df.pivot_table(index=date_col, columns=brand_col, values="pkg", aggfunc="mean")
+            .sort_index().replace([np.inf, -np.inf], np.nan).dropna(how="all")
         )
-        if "customer_count" in per_kg_trend_df.columns:
-            customer_count_pivot = (
-                per_kg_trend_df.pivot_table(
-                    index=date_col,
-                    columns=brand_col,
-                    values="customer_count",
-                    aggfunc="first",
-                )
-                .reindex(per_kg_pivot.index)
-                .sort_index()
-            )
-        if not per_kg_pivot.empty:
-            price_fig = go.Figure()
-            base_series_per_date = per_kg_pivot[base_brand] if base_brand in per_kg_pivot.columns else None
-            other_max_per_date = None
-            if base_series_per_date is not None:
-                other_cols = [col for col in per_kg_pivot.columns if col != base_brand]
-                if other_cols:
-                    other_max_per_date = per_kg_pivot[other_cols].max(axis=1)
-            for brand in per_kg_pivot.columns:
-                series = per_kg_pivot[brand].dropna()
-                if series.empty:
+        if not pkg_piv.empty:
+            base_pkg_s = pkg_piv.get(base_brand)
+            other_max = pkg_piv[[c for c in pkg_piv.columns if c != base_brand]].max(axis=1) if len(pkg_piv.columns) > 1 else None
+
+            pfig = go.Figure()
+            for b in pkg_piv.columns:
+                s = pkg_piv[b].dropna()
+                if s.empty:
                     continue
-                color = brand_color_map.get(brand, muted_color)
-                marker_colors: list[str] | str = color
-                count_values: np.ndarray | list[Any]
-                if customer_count_pivot is not None and brand in customer_count_pivot.columns:
-                    aligned_counts = customer_count_pivot[brand].reindex(series.index)
-                    count_values = aligned_counts.values
-                else:
-                    count_values = [None] * len(series)
-                marker_border_colors: list[str] = []
-                if base_series_per_date is not None and brand != base_brand:
-                    aligned_base = base_series_per_date.reindex(series.index)
-                    label_text = []
-                    marker_colors = []
-                    for val, base_val, count_val in zip(series.values, aligned_base.values, count_values):
-                        count_text = _format_customer_count(count_val)
-                        border_color = _customer_border_color(count_val, color)
-                        if pd.isna(base_val):
-                            text_value = f"{val:,.2f}"
-                            marker_colors.append(color)
+                color = brand_clr.get(b, MUTED)
+                labels, mk_clr, mk_brd = [], [], []
+                for i, val in enumerate(s.values):
+                    brd = _border_color(None, color)
+                    mk_brd.append(brd)
+                    if b != base_brand and base_pkg_s is not None:
+                        bv = base_pkg_s.reindex(s.index).iloc[i] if i < len(s) else np.nan
+                        if pd.isna(bv):
+                            mk_clr.append(color); txt = _fmt_kg(val)
                         else:
-                            diff_val = float(val) - float(base_val)
-                            if float(base_val) == 0:
-                                text_value = f"{val:,.2f} (n/a)"
-                            else:
-                                diff_pct = (diff_val / float(base_val)) * 100.0
-                                text_value = f"{val:,.2f} ({diff_pct:+.1f}%)"
-                            marker_colors.append("#ff1744" if diff_val < 0 else color)
-                        marker_border_colors.append(border_color)
-                        if count_text:
-                            text_value = f"{text_value}<br>{count_text}"
-                        label_text.append(text_value)
-                else:
-                    label_text = []
-                    if brand == base_brand and other_max_per_date is not None:
-                        aligned_other_max = other_max_per_date.reindex(series.index)
-                        marker_colors = []
-                        for val, other_val, count_val in zip(series.values, aligned_other_max.values, count_values):
-                            if pd.isna(other_val):
-                                marker_colors.append(color)
-                            else:
-                                marker_colors.append("#00e676" if float(val) < float(other_val) else color)
-                            count_text = _format_customer_count(count_val)
-                            marker_border_colors.append(_customer_border_color(count_val, color))
-                            text_value = f"{val:,.2f}"
-                            if count_text:
-                                text_value = f"{text_value}<br>{count_text}"
-                            label_text.append(text_value)
+                            diff = float(val) - float(bv)
+                            pct = (diff / float(bv) * 100) if float(bv) != 0 else 0
+                            mk_clr.append("#ff1744" if diff < 0 else color)
+                            txt = f"{_fmt_kg(val)} ({pct:+.1f}%)"
                     else:
-                        marker_colors = [color] * len(series)
-                        for val, count_val in zip(series.values, count_values):
-                            count_text = _format_customer_count(count_val)
-                            marker_border_colors.append(_customer_border_color(count_val, color))
-                            text_value = f"{val:,.2f}"
-                            if count_text:
-                                text_value = f"{text_value}<br>{count_text}"
-                            label_text.append(text_value)
-                    if marker_border_colors and len(marker_border_colors) < len(label_text):
-                        marker_border_colors.extend([
-                            _customer_border_color(None, color)
-                            for _ in range(len(label_text) - len(marker_border_colors))
-                        ])
-                    elif not marker_border_colors:
-                        marker_border_colors = [
-                            _customer_border_color(count_val, color) for count_val in count_values
-                        ]
-                label_positions = [
-                    "top center" if (idx % 2 == 0) else "bottom center" for idx in range(len(label_text))
-                ]
-                price_fig.add_trace(
-                    go.Scatter(
-                        x=series.index,
-                        y=series.values,
-                        mode="lines+markers+text",
-                        name=brand,
-                        visible=True if brand == base_brand else "legendonly",
-                        text=label_text,
-                        textposition=label_positions,
-                        textfont=dict(size=11, color=color),
-                        line=dict(
-                            color=color,
-                            width=2 if brand == base_brand else 1,
-                        ),
-                        marker=dict(
-                            size=9 if brand == base_brand else 7,
-                            color=marker_colors,
-                            line=dict(
-                                color=marker_border_colors,
-                                width=2,
-                            ),
-                        ),
-                        hovertemplate="<b>%{fullData.name}</b><br>Date: %{x|%Y-%m-%d}<br>Price per KG: %{y:,.2f}<extra></extra>",
-                    )
-                )
-            price_fig.update_layout(
-                title="Price per KG promoted trend",
-                yaxis_title="Price per KG",
-                xaxis_title="Date",
-                hovermode="x unified",
-                font=dict(color="#111111"),
+                        if other_max is not None and i < len(other_max):
+                            ov = other_max.reindex(s.index).iloc[i]
+                            mk_clr.append("#00e676" if (not pd.isna(ov) and float(val) < float(ov)) else color)
+                        else:
+                            mk_clr.append(color)
+                        txt = _fmt_kg(val)
+                    labels.append(txt)
+
+                positions = ["top center" if i % 2 == 0 else "bottom center" for i in range(len(labels))]
+                pfig.add_trace(go.Scatter(
+                    x=s.index, y=s.values, mode="lines+markers+text", name=b,
+                    text=labels, textposition=positions, textfont=dict(size=11, color=color),
+                    line=dict(color=color, width=2 if b == base_brand else 1),
+                    marker=dict(size=9 if b == base_brand else 7, color=mk_clr,
+                                line=dict(color=mk_brd, width=2)),
+                    hovertemplate="<b>%{fullData.name}</b><br>%{x|%Y-%m-%d}: %{y:,.2f}<extra></extra>",
+                    visible=True if b in initial_visible else "legendonly",
+                ))
+
+            pfig.update_layout(
+                title="Price per KG (promoted) — trend",
+                yaxis_title="Price / KG", xaxis_title="Date",
+                hovermode="x unified", font=dict(color="#111"),
                 legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
             )
-            price_fig.update_yaxes(tickprefix="", separatethousands=True)
-            price_fig.update_xaxes(tickformat="%Y-%m-%d")
-            st.plotly_chart(price_fig, use_container_width=True)
+            pfig.update_yaxes(separatethousands=True)
+            pfig.update_xaxes(tickformat="%Y-%m-%d")
+            st.plotly_chart(pfig, use_container_width=True)
 
-            if base_series_per_date is not None:
-                response_rows: list[dict[str, object]] = []
-                for competitor in [col for col in per_kg_pivot.columns if col != base_brand]:
-                    aligned = pd.concat(
-                        [
-                            base_series_per_date.rename("base"),
-                            per_kg_pivot[competitor].rename("competitor"),
-                        ],
-                        axis=1,
-                    ).dropna()
-                    if aligned.empty:
+            # ── Response-time table ────────────────────────────────────────────
+            if base_pkg_s is not None:
+                resp = []
+                for comp in [c for c in pkg_piv.columns if c != base_brand]:
+                    aln = pd.concat(
+                        [base_pkg_s.rename("base"), pkg_piv[comp].rename("comp")], axis=1
+                    ).dropna().sort_index()
+                    if aln.empty:
                         continue
-                    aligned = aligned.sort_index()
-                    diff = aligned["base"] - aligned["competitor"]
-
-                    last_above_date = None
-                    event_above_date = None
-                    event_below_date = None
-                    for current_date, current_diff in diff.items():
-                        if current_diff > 0:
-                            last_above_date = current_date
-                        elif current_diff < 0 and last_above_date is not None:
-                            event_above_date = last_above_date
-                            event_below_date = current_date
-                            last_above_date = None
-
-                    if event_above_date is not None and event_below_date is not None:
-                        response_days = (event_below_date - event_above_date).days
-                        response_rows.append(
-                            {
-                                "Brand": competitor,
-                                "Above date": event_above_date,
-                                "Below date": event_below_date,
-                                "Response time (days)": int(response_days),
-                            }
-                        )
-
-                if response_rows:
-                    response_df = pd.DataFrame(response_rows).sort_values(
-                        "Response time (days)", ascending=True
-                    )
-                    st.markdown("#### Response time to compete")
+                    diff = aln["base"] - aln["comp"]
+                    last_a = ea = eb = None
+                    for d, v in diff.items():
+                        if v > 0:
+                            last_a = d
+                        elif v < 0 and last_a is not None:
+                            ea, eb, last_a = last_a, d, None
+                    if ea and eb:
+                        resp.append({"Brand": comp, "Above date": ea, "Below date": eb,
+                                     "Response time (days)": int((eb - ea).days)})
+                if resp:
+                    st.markdown("#### ⏱️ Response time to compete")
                     st.dataframe(
-                        response_df,
-                        use_container_width=True,
-                        hide_index=True,
+                        pd.DataFrame(resp).sort_values("Response time (days)"),
+                        use_container_width=True, hide_index=True,
                         column_config={
                             "Above date": st.column_config.DateColumn(format="YYYY-MM-DD"),
                             "Below date": st.column_config.DateColumn(format="YYYY-MM-DD"),
@@ -1085,187 +916,318 @@ if date_col != "(none)" and filtered[date_col].notna().any():
                         },
                     )
 
-    relative_primary = relative_traces.get(selected_price_cols[0])
-    if relative_primary is not None and not relative_primary.empty:
-        avg_relative = (
-            relative_primary.groupby(brand_col, as_index=False)["relative_value"].mean()
-            .sort_values("relative_value", ascending=False)
-        )
-        brand_order = avg_relative[brand_col].tolist()
-        brand_avg_per_kg: dict[str, float] = {}
-        for brand, per_kg_col in brand_per_kg_columns.items():
-            if per_kg_col in filtered.columns:
-                per_values = filtered.loc[filtered[brand_col].astype(str) == brand, per_kg_col].dropna()
-                if not per_values.empty:
-                    brand_avg_per_kg[brand] = float(per_values.mean())
-        avg_relative["price_per_kg_value"] = avg_relative[brand_col].map(brand_avg_per_kg.get)
-        avg_relative["display_text"] = avg_relative.apply(
-            lambda row: (
-                _format_percent_with_per_kg(row["relative_value"], row["price_per_kg_value"])
-                if show_price_labels
-                else _format_percent_with_per_kg(row["relative_value"], None)
-            ),
-            axis=1,
-        )
-        st.markdown("### Average price index (Δ vs base)")
-        if start_date and end_date:
-            st.caption(f"Average across selected date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")
-        bar_fig = px.bar(
-            avg_relative,
-            x=brand_col,
-            y="relative_value",
-            text="display_text",
-            labels={brand_col: "Brand", "relative_value": "Δ vs base"},
-            title=f"{selected_price_cols[0]} Δ vs {base_brand} (avg)",
-            color=brand_col,
-            color_discrete_map=brand_color_map,
-        )
-        bar_fig.update_traces(
-            texttemplate="%{text}",
-            textposition="outside",
-            marker_line_color="#546e7a",
-            marker_line_width=1,
-            textfont=dict(color="#111111", size=12),
-        )
-        bar_fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111111"))
-        for trace in bar_fig.data:
-            if trace.name not in initial_visible_brands:
-                trace.visible = "legendonly"
-        bar_fig.update_layout(
-            xaxis=dict(
-                categoryorder="array",
-                categoryarray=brand_order,
-                tickfont=dict(size=14, color="#111111"),
-            ),
-            font=dict(color="#111111"),
-        )
-        if base_brand in avg_relative[brand_col].values:
-            base_row = avg_relative.loc[avg_relative[brand_col] == base_brand]
-            if not base_row.empty:
-                base_value = float(base_row["relative_value"].iloc[0])
-                bar_fig.add_annotation(
-                    x=base_brand,
-                    y=base_value,
-                    text="Base brand",
-                    showarrow=True,
-                    arrowhead=3,
-                    arrowsize=1.4,
-                    arrowwidth=2,
-                    arrowcolor=base_bar_color,
-                    ax=0,
-                    ay=-40,
-                    bgcolor="rgba(253,216,83,0.25)",
-                    bordercolor=base_bar_color,
-                    font=dict(color="#000000", size=12, family="Segoe UI Semibold"),
-                )
-        st.plotly_chart(bar_fig, use_container_width=True)
-    else:
-        avg_dates = (
-            filtered[[brand_col] + selected_price_cols]
-            .groupby(brand_col, as_index=False)[selected_price_cols[0]]
-            .mean()
-            .sort_values(selected_price_cols[0], ascending=False)
-        )
-        brand_order = avg_dates[brand_col].tolist()
-        brand_avg_per_kg: dict[str, float] = {}
-        for brand, per_kg_col in brand_per_kg_columns.items():
-            if per_kg_col in filtered.columns:
-                per_values = filtered.loc[filtered[brand_col].astype(str) == brand, per_kg_col].dropna()
-                if not per_values.empty:
-                    brand_avg_per_kg[brand] = float(per_values.mean())
-        avg_dates["price_per_kg_value"] = avg_dates[brand_col].map(brand_avg_per_kg.get)
-        avg_dates["display_text"] = avg_dates.apply(
-            lambda row: (
-                _format_percent_with_per_kg(row[selected_price_cols[0]], row["price_per_kg_value"])
-                if show_price_labels
-                else _format_percent_with_per_kg(row[selected_price_cols[0]], None)
-            ),
-            axis=1,
-        )
-        st.markdown("### Average price index")
-        if start_date and end_date:
-            st.caption(f"Average across selected date range: {start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}")
-        bar_fig = px.bar(
-            avg_dates,
-            x=brand_col,
-            y=selected_price_cols[0],
-            text="display_text",
-            labels={brand_col: "Brand", selected_price_cols[0]: selected_price_cols[0]},
-            title=f"{selected_price_cols[0]} by brand (avg)",
-            color=brand_col,
-            color_discrete_map=brand_color_map,
-        )
-        bar_fig.update_traces(
-            texttemplate="%{text}",
-            textposition="outside",
-            marker_line_color="#546e7a",
-            marker_line_width=1,
-            textfont=dict(color="#111111", size=12),
-        )
-        bar_fig.update_yaxes(tickformat=".0%", tickfont=dict(color="#111111"))
-        for trace in bar_fig.data:
-            if trace.name not in initial_visible_brands:
-                trace.visible = "legendonly"
-        bar_fig.update_layout(
-            xaxis=dict(
-                categoryorder="array",
-                categoryarray=brand_order,
-                tickfont=dict(size=14, color="#111111"),
-            ),
-            font=dict(color="#111111"),
-        )
-        if base_brand in avg_dates[brand_col].values:
-            base_row = avg_dates.loc[avg_dates[brand_col] == base_brand]
-            if not base_row.empty:
-                base_value = float(base_row[selected_price_cols[0]].iloc[0])
-                bar_fig.add_annotation(
-                    x=base_brand,
-                    y=base_value,
-                    text="Base brand",
-                    showarrow=True,
-                    arrowhead=3,
-                    arrowsize=1.4,
-                    arrowwidth=2,
-                    arrowcolor=base_bar_color,
-                    ax=0,
-                    ay=-40,
-                    bgcolor="rgba(253,216,83,0.25)",
-                    bordercolor=base_bar_color,
-                    font=dict(color="#000000", size=12, family="Segoe UI Semibold"),
-                )
-        st.plotly_chart(bar_fig, use_container_width=True)
+# ── Bar chart: average Δ vs base ──────────────────────────────────────────────
+rel_prim = rel_traces.get(active_pi[0]) if rel_traces else None
+
+avg_pkg: dict[str, float] = {
+    b: float(filtered.loc[filtered[brand_col].astype(str) == b, c].dropna().mean())
+    for b, c in brand_pkg_cols.items()
+    if not filtered.loc[filtered[brand_col].astype(str) == b, c].dropna().empty
+}
+
+if rel_prim is not None and not rel_prim.empty:
+    avg_r = rel_prim.groupby(brand_col, as_index=False)["rel"].mean().sort_values("rel", ascending=False)
+    avg_r["pkg"] = avg_r[brand_col].map(avg_pkg.get)
+    avg_r["lbl"] = avg_r.apply(lambda r: _fmt_pct_kg(r["rel"], r["pkg"] if show_labels else None), axis=1)
+    st.markdown("### Average price index (Δ vs base)")
+    if start_date and end_date:
+        st.caption(f"Average: {start_date:%Y-%m-%d} → {end_date:%Y-%m-%d}")
+    bar = px.bar(
+        avg_r, x=brand_col, y="rel", text="lbl",
+        labels={brand_col: "Brand", "rel": "Δ vs base"},
+        title=f"{active_pi[0]} Δ vs {base_brand} (avg)",
+        color=brand_col, color_discrete_map=brand_clr,
+    )
+    bar.update_traces(texttemplate="%{text}", textposition="outside",
+                      marker_line_color="#546e7a", marker_line_width=1,
+                      textfont=dict(color="#111", size=12))
+    bar.update_yaxes(tickformat=".0%", tickfont=dict(color="#111"))
+    bar.update_layout(
+        xaxis=dict(categoryorder="array", categoryarray=avg_r[brand_col].tolist(),
+                   tickfont=dict(size=14, color="#111")),
+        font=dict(color="#111"),
+    )
+    if base_brand in avg_r[brand_col].values:
+        bv = float(avg_r.loc[avg_r[brand_col] == base_brand, "rel"].iloc[0])
+        bar.add_annotation(x=base_brand, y=bv, text="Base brand",
+                           showarrow=True, arrowhead=3, arrowsize=1.4, arrowwidth=2,
+                           arrowcolor=BASE_CLR, ax=0, ay=-40,
+                           bgcolor="rgba(253,216,83,0.25)", bordercolor=BASE_CLR,
+                           font=dict(color="#000", size=12))
+    st.plotly_chart(bar, use_container_width=True)
 
 else:
-    st.info("Date column not provided or contains no valid timestamps. Showing aggregated view only.")
+    avg_r2 = (
+        filtered[[brand_col] + active_pi]
+        .groupby(brand_col, as_index=False)[active_pi[0]].mean()
+        .sort_values(active_pi[0], ascending=False)
+    )
+    avg_r2["pkg"] = avg_r2[brand_col].map(avg_pkg.get)
+    avg_r2["lbl"] = avg_r2.apply(lambda r: _fmt_pct_kg(r[active_pi[0]], r["pkg"] if show_labels else None), axis=1)
+    st.markdown("### Average price index")
+    bar = px.bar(
+        avg_r2, x=brand_col, y=active_pi[0], text="lbl",
+        labels={brand_col: "Brand", active_pi[0]: active_pi[0]},
+        title=f"{active_pi[0]} by brand (avg)",
+        color=brand_col, color_discrete_map=brand_clr,
+    )
+    bar.update_traces(texttemplate="%{text}", textposition="outside",
+                      marker_line_color="#546e7a", marker_line_width=1,
+                      textfont=dict(color="#111", size=12))
+    bar.update_yaxes(tickformat=".0%", tickfont=dict(color="#111"))
+    bar.update_layout(
+        xaxis=dict(categoryorder="array", categoryarray=avg_r2[brand_col].tolist(),
+                   tickfont=dict(size=14, color="#111")),
+        font=dict(color="#111"),
+    )
+    if base_brand in avg_r2[brand_col].values:
+        bv = float(avg_r2.loc[avg_r2[brand_col] == base_brand, active_pi[0]].iloc[0])
+        bar.add_annotation(x=base_brand, y=bv, text="Base brand",
+                           showarrow=True, arrowhead=3, arrowsize=1.4, arrowwidth=2,
+                           arrowcolor=BASE_CLR, ax=0, ay=-40,
+                           bgcolor="rgba(253,216,83,0.25)", bordercolor=BASE_CLR,
+                           font=dict(color="#000", size=12))
+    st.plotly_chart(bar, use_container_width=True)
 
-with st.expander("Brand snapshot", expanded=False):
-    if pivot_summary.empty:
-        st.info("No price per KG values are available to summarize for the selected period.")
+if not has_dates:
+    st.info("No date column selected — showing aggregated view only.")
+
+# ── Brand snapshot ────────────────────────────────────────────────────────────
+with st.expander("📋 Brand snapshot (price per KG, all items)", expanded=False):
+    # Apply channel / customer / date filters to the full working dataset
+    snap = wdf.copy()
+    if channel_col != "(none)" and channel_sel:
+        snap = snap[snap[channel_col].astype(str).isin(channel_sel)]
+    if customer_col != "(none)" and customer_sel:
+        snap = snap[snap[customer_col].astype(str).isin(customer_sel)]
+    if date_col != "(none)" and start_date and end_date:
+        snap = snap[snap[date_col].dt.date.between(start_date, end_date)]
+    if date_col != "(none)" and selected_date is not None:
+        snap = snap[snap[date_col].dt.date == selected_date]
+
+    # All SKUs present in the filtered dataset
+    all_skus = snap[item_col].dropna().astype(str).sort_values().unique().tolist()
+
+    def _resolve_com(sku: str) -> tuple[str | None, list[str]]:
+        """Return (base_brand, [competitors]) for a given SKU using Com map + prefix fallback."""
+        entry = com_map.get(sku, {})
+        if not entry:
+            prefix = sku.split("_")[0].strip()
+            for com_key, com_val in com_map.items():
+                if com_key.split("_")[0].strip() == prefix:
+                    entry = com_val
+                    break
+        for b in brands_list:
+            if b in entry:
+                return b, entry[b]
+        if entry:
+            first_key = next(iter(entry))
+            return first_key, entry[first_key]
+        return None, []
+
+    # Build numeric price rows
+    snap_rows: list[dict] = []
+    for sku in all_skus:
+        base_b, competitors = _resolve_com(sku)
+        brands_for_sku = list(dict.fromkeys(([base_b] if base_b else []) + competitors))
+        if not brands_for_sku:
+            brands_for_sku = (
+                snap.loc[snap[item_col].astype(str) == sku, brand_col]
+                .astype(str).unique().tolist()
+            )
+        row: dict = {"Item": sku, "_base_brand": base_b or ""}
+        for b in brands_for_sku:
+            pkg_c = brand_pkg_map.get(b) or generic_pkg
+            if not pkg_c or pkg_c not in snap.columns:
+                row[b] = np.nan
+                continue
+            vals = snap.loc[
+                (snap[item_col].astype(str) == sku) & (snap[brand_col].astype(str) == b),
+                pkg_c,
+            ].dropna()
+            row[b] = float(vals.mean()) if not vals.empty else np.nan
+        snap_rows.append(row)
+
+    if not snap_rows:
+        st.info("No price-per-KG data for the current selection.")
     else:
-        export_table = pivot_summary.copy()
-        export_reset = export_table.reset_index()
-        buffer = BytesIO()
-        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-            export_table.to_excel(writer, sheet_name="Price per KG")
-            worksheet = writer.sheets["Price per KG"]
-            for col_idx, column in enumerate(export_reset.columns):
-                max_len = max(export_reset[column].astype(str).map(len).max(), len(str(column)))
-                worksheet.set_column(col_idx, col_idx, max_len + 2)
-        buffer.seek(0)
+        snap_df = pd.DataFrame(snap_rows).set_index("Item")
+        base_brand_col_map = snap_df.pop("_base_brand")
+        snap_df = snap_df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+
+        # ── Build display dataframe with arrows + % diff for competitor cells ──
+        # For each row: competitor cell = "price  ▲/▼ diff (±%)"
+        # ▲ red  = competitor HIGHER than base  (base brand is cheaper → good for base)
+        # ▼ green = competitor LOWER than base  (competitor is cheaper → threat)
+        display_rows: list[dict] = []
+        cell_styles: list[dict] = []          # parallel list of style dicts per row
+
+        for sku, row_data in snap_df.iterrows():
+            sku_base = base_brand_col_map.get(sku, "")
+            base_price = row_data.get(sku_base, np.nan)
+            disp_row: dict = {"Item": sku}
+            style_row: dict = {"Item": ""}
+            for col_name in snap_df.columns:
+                val = row_data[col_name]
+                if pd.isna(val):
+                    disp_row[col_name] = "—"
+                    style_row[col_name] = "color: #aaaaaa"
+                elif col_name == sku_base:
+                    # Base brand: just show price, highlighted yellow
+                    disp_row[col_name] = f"{val:,.2f}"
+                    style_row[col_name] = "background-color: #fff59d; font-weight: 700"
+                else:
+                    # Competitor: show price + arrow + diff vs base
+                    if pd.notna(base_price) and base_price != 0:
+                        diff = val - base_price
+                        diff_pct = (diff / base_price) * 100
+                        if diff > 0:
+                            # Competitor more expensive → base brand is cheaper → good
+                            arrow = "▲"
+                            style_row[col_name] = "color: #2e7d32; font-weight: 600"  # green
+                        else:
+                            # Competitor cheaper → threat to base brand
+                            arrow = "▼"
+                            style_row[col_name] = "color: #d32f2f; font-weight: 600"  # red
+                        disp_row[col_name] = f"{val:,.2f}  {arrow} {abs(diff):,.2f} ({diff_pct:+.1f}%)"
+                    else:
+                        disp_row[col_name] = f"{val:,.2f}"
+                        style_row[col_name] = ""
+            display_rows.append(disp_row)
+            cell_styles.append(style_row)
+
+        disp_df = pd.DataFrame(display_rows).set_index("Item")
+        styles_df = pd.DataFrame(cell_styles).set_index("Item")
+
+        # Streamlit styled table
+        def _apply_precomputed_styles(df: pd.DataFrame, styles: pd.DataFrame) -> "pd.io.formats.style.Styler":
+            styler = df.style
+            def _cell_style(val, row_label, col_label):
+                return styles.loc[row_label, col_label] if col_label in styles.columns else ""
+            # apply cell-wise
+            for col in df.columns:
+                styler = styler.apply(
+                    lambda s, c=col: [
+                        styles.loc[idx, c] if idx in styles.index and c in styles.columns else ""
+                        for idx in s.index
+                    ],
+                    subset=[col],
+                    axis=0,
+                )
+            return styler
+
+        st.caption(
+            f"📊 **{len(snap_df)} SKUs** — price per KG after promotion. "
+            "Base brand highlighted 🟡 | "
+            "**▲ green** = competitor higher than base | **▼ red** = competitor lower than base"
+        )
+        styled_disp = _apply_precomputed_styles(disp_df, styles_df)
+        st.dataframe(styled_disp, use_container_width=True)
+
+        # ── Excel export with colored cells + arrow text ──────────────────────
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+            wb = writer.book
+            ws = wb.add_worksheet("Brand Snapshot")
+
+            # Define formats
+            header_fmt = wb.add_format({
+                "bold": True, "bg_color": "#1b5e20", "font_color": "#ffffff",
+                "border": 1, "align": "center", "valign": "vcenter",
+            })
+            base_fmt = wb.add_format({
+                "bg_color": "#fff59d", "bold": True, "border": 1,
+                "num_format": "#,##0.00", "align": "center",
+            })
+            comp_higher_fmt = wb.add_format({
+                # competitor more expensive → green text (▲)
+                "border": 1, "align": "center", "font_color": "#1b5e20",
+                "bold": True, "text_wrap": True,
+            })
+            comp_lower_fmt = wb.add_format({
+                # competitor cheaper → red text (▼)
+                "border": 1, "align": "center", "font_color": "#c62828",
+                "bold": True, "text_wrap": True,
+            })
+            na_fmt = wb.add_format({
+                "border": 1, "align": "center", "font_color": "#aaaaaa",
+            })
+            item_fmt = wb.add_format({
+                "bold": True, "border": 1, "text_wrap": True, "valign": "vcenter",
+            })
+            subheader_fmt = wb.add_format({
+                "bold": True, "bg_color": "#e8f5e9", "border": 1,
+                "align": "center", "italic": True, "font_color": "#555555",
+            })
+
+            all_brand_cols = snap_df.columns.tolist()
+            all_export_cols = ["Item"] + all_brand_cols
+
+            # Header row
+            for ci, col_name in enumerate(all_export_cols):
+                ws.write(0, ci, col_name, header_fmt)
+
+            # Sub-header row: label each brand column as "Base" or "Competitor"
+            ws.write(1, 0, "", subheader_fmt)
+            for ci, col_name in enumerate(all_brand_cols, start=1):
+                # Check if this brand is ever a base brand
+                is_base_col = any(
+                    base_brand_col_map.get(sku, "") == col_name for sku in snap_df.index
+                )
+                label = "◆ Base Brand" if is_base_col else "Competitor"
+                ws.write(1, ci, label, subheader_fmt)
+
+            # Data rows (start at row 2 because of sub-header)
+            for ri, (sku, row_data) in enumerate(snap_df.iterrows(), start=2):
+                ws.write(ri, 0, sku, item_fmt)
+                ws.set_row(ri, 30)
+                sku_base = base_brand_col_map.get(sku, "")
+                base_price = row_data.get(sku_base, np.nan)
+
+                for ci, col_name in enumerate(all_brand_cols, start=1):
+                    val = row_data[col_name]
+                    if pd.isna(val):
+                        ws.write(ri, ci, "—", na_fmt)
+                    elif col_name == sku_base:
+                        ws.write_number(ri, ci, float(val), base_fmt)
+                    else:
+                        if pd.notna(base_price) and base_price != 0:
+                            diff = float(val) - float(base_price)
+                            diff_pct = (diff / float(base_price)) * 100
+                            arrow = "▲" if diff > 0 else "▼"
+                            text = f"{val:,.2f}  {arrow} {abs(diff):,.2f} ({diff_pct:+.1f}%)"
+                            fmt = comp_higher_fmt if diff > 0 else comp_lower_fmt
+                        else:
+                            text = f"{val:,.2f}"
+                            fmt = wb.add_format({"border": 1, "align": "center"})
+                        ws.write(ri, ci, text, fmt)
+
+            # Column widths + freeze
+            ws.set_column(0, 0, 42)
+            for ci in range(1, len(all_export_cols)):
+                ws.set_column(ci, ci, 22)
+            ws.freeze_panes(2, 1)
+
+            # Legend box below data
+            legend_row = len(snap_df) + 4
+            legend_title_fmt = wb.add_format({"bold": True, "font_size": 11})
+            ws.write(legend_row, 0, "Legend:", legend_title_fmt)
+            ws.write(legend_row + 1, 0, "🟡 Yellow = Base brand price",
+                     wb.add_format({"bg_color": "#fff59d", "border": 1}))
+            ws.write(legend_row + 2, 0, "▲ Green = Competitor HIGHER than base (base brand is cheaper)",
+                     wb.add_format({"font_color": "#1b5e20", "bold": True, "border": 1}))
+            ws.write(legend_row + 3, 0, "▼ Red = Competitor LOWER than base (competitive threat)",
+                     wb.add_format({"font_color": "#c62828", "bold": True, "border": 1}))
+
+        buf.seek(0)
         st.download_button(
-            "⬇️ Download prices (Excel)",
-            data=buffer.getvalue(),
-            file_name=f"brand_snapshot_{pd.Timestamp.now().strftime('%Y%m%d%H%M%S')}.xlsx",
+            "⬇️ Download full snapshot (Excel)",
+            data=buf.getvalue(),
+            file_name=f"brand_snapshot_all_{pd.Timestamp.now():%Y%m%d%H%M%S}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-        st.write(
-            styled_summary.to_html(classes="brand-snapshot-table", escape=False),
-            unsafe_allow_html=True,
-        )
 
-with st.expander("Show filtered records"):
+with st.expander("🔍 Filtered records"):
     st.dataframe(filtered, use_container_width=True, hide_index=True)
 
-st.caption(
-    "Tip: Install required packages with `pip install streamlit pandas numpy plotly pyxlsb` (pyxlsb is only needed for .xlsb files)."
-)
+st.caption("pip install streamlit pandas numpy plotly xlsxwriter pyxlsb")
